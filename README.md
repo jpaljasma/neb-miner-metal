@@ -1,4 +1,51 @@
-# NEB
+# neb-miner-metal
+
+A mainnet NEB miner for the Apple M1 Max GPU, based on [SilasEigen/neb v1.0.9](https://github.com/SilasEigen/neb/tree/v1.0.9). It connects to the NEB node work service and mines both KEP1 slots, Kepler and TESS. The node and the miner use the upstream C implementation to verify candidate shares.
+
+## Build and run on macOS
+
+Install a stable arm64 Rust toolchain and the Xcode Command Line Tools. From the repository root:
+
+```sh
+cargo build --manifest-path node/Cargo.toml --release --locked -p neb-gpuminer --features metal --bin neb-miner-metal
+mkdir -p build
+curl --fail --location --output build/neb-datasets.bin https://github.com/SilasEigen/neb/releases/download/v1.0.9/neb-datasets.bin
+node/target/release/neb-miner-metal --dataset build/neb-datasets.bin --benchmark
+```
+
+The miner checks the release dataset's BLAKE3 hash at startup. The benchmark runs offline. To mine with a synced node configured with your mining lock, use:
+
+```sh
+node/target/release/neb-miner-metal --dataset build/neb-datasets.bin --node 127.0.0.1:3441
+```
+
+### Test a real Suprnova TLS share
+
+Save your own public NEB payout address on one line in `.neb-payout-address` at the repository root. Git ignores this file. Set `POOL_URL` to your Suprnova NEB TLS endpoint, then run:
+
+```sh
+python3 tools/test_metal_stratum.py --pool "$POOL_URL"
+```
+
+The Python 3 adapter connects with certificate and hostname verification, starts the release Metal executable on a temporary loopback work service, and submits its CPU-checked candidate under your payout login. It requests a fixed difficulty of one million attempts per share, subject to the pool's limits. The test exits after the first pool acceptance or a 120-second timeout and shuts down the child. An acceptance confirms submitted work. Account credit and payout follow the pool's accounting rules. [Suprnova's NEB Stratum specification](https://neb.suprnova.cc/CoinInfos.html#stratum)
+
+### How the Metal engine works
+
+The host precomputes upstream's per-sample gradient table when it loads a slot's weights. Each Metal threadgroup combines the 16 samples for one nonce. The 128 threads share signed-byte factors for the dense layers and reduce the result into eight digest lanes. When all sampled errors for a dense output are zero, the kernel computes that output's contribution as an arithmetic sum. The CPU handles sample selection, BLAKE3 hashing and target comparison.
+
+The work-service client rechecks every candidate with the CPU reference before submitting it, probes each new model and audits ongoing scans. A failed parity check switches the affected slot to the reference scanner. The executable prints attempts/s, submitted shares, accepted blocks, mismatches and fallbacks.
+
+### Reproduce the local node test
+
+This test uses the same local payout address file. It starts an isolated NEB node on loopback with easier difficulty and proof verification enabled, then checks that the node accepts at least three blocks, includes shares, and credits each block's miner output to the specified lock. These blocks belong to the isolated test chain.
+
+```sh
+NEB_MAINNET_DATASET="$PWD/build/neb-datasets.bin" cargo test --manifest-path node/Cargo.toml --locked --release -p neb-gpuminer --features metal --test metal_node -- --ignored --nocapture
+```
+
+The [M1 Max benchmark](docs/metal-benchmark.md) records the workload and results. Related work includes [upstream PR #2](https://github.com/SilasEigen/neb/pull/2), an independent Metal implementation, and [Suprminer's model-specific GPU benchmarks](https://github.com/ocminer/suprminer/releases/tag/v1.9.60).
+
+## Upstream NEB
 
 NEB (Neural Engine Byte) is a proof-of-work cryptocurrency where mining trains a neural network. Every mining attempt is one training step of a small network that the chain owns, computed in exact integer arithmetic. The chain trains two small convolutional networks with 4-bit weights on public scientific data, one block each in turn, both on exoplanet searches: transit signals of the Kepler mission (NASA Exoplanet Archive), sorted into planet candidates and false positives, and signals found in the light curves of the TESS mission (Astronet-Triage-v2), sorted into eclipses and junk. A node checks a block by running its attempts again, about 2 ms of one CPU core per attempt, with no zero-knowledge proof and no trusted party.
 

@@ -1,5 +1,6 @@
 node/target/
 build/
+/.neb-payout-address
 __pycache__/
 *.o
 *.obj

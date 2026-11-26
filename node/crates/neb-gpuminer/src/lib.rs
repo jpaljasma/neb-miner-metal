@@ -65,6 +65,8 @@ impl GpuKernel {
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_scanner;
 pub mod stats;
 pub mod telemetry;
 
@@ -274,7 +276,7 @@ pub fn spawn_worker_with_fallback(
         let switch =
             |scanner: &mut Box<dyn Scanner>, fallback: &mut Option<Fallback>, model: &Model, why: &str| -> bool {
                 let Some(make) = fallback.take() else { return false };
-                eprintln!("neb-miner-gpu: {why}; switching this device to K0");
+                eprintln!("neb-miner-gpu: {why}; switching to the fallback scanner");
                 match make().and_then(|mut s| {
                     s.set_weights(model)?;
                     Ok(s)
@@ -285,7 +287,7 @@ pub fn spawn_worker_with_fallback(
                         true
                     }
                     Err(e) => {
-                        eprintln!("neb-miner-gpu: cannot open K0 on the device: {e}");
+                        eprintln!("neb-miner-gpu: cannot open the fallback scanner: {e}");
                         false
                     }
                 }
