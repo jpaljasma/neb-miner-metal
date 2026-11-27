@@ -175,6 +175,29 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([d["code"] for e,d in self.events.events if e=="rejected"], [21])
         self.assertIn("stale_local_hit", [e for e,_ in self.events.events])
 
+    async def test_buffered_clean_notify_precedes_ready_miner_hit(self):
+        await self.job()
+        # All three frames are readable before the session loop next runs.
+        self.send(method="mining.set_difficulty", params=[2_000_000])
+        self.notify("new-parent", True)
+        self.hit(1, 7)
+        await asyncio.wait_for(self.to_worker.sent.get(), 1)
+        self.hit(2, 8)
+        submission = await self.recv_pool()
+        self.assertEqual(submission["params"][1], "new-parent")
+        self.assertEqual(submission["params"][-1], "00000008")
+        self.assertIn(("stale_local_hit", {"sequence": 1}), self.events.events)
+
+    async def test_buffered_nonclean_refresh_preserves_ready_miner_hit(self):
+        await self.job()
+        self.send(method="mining.set_difficulty", params=[2_000_000])
+        self.notify("same-parent", False)
+        self.hit(1, 7)
+        submission = await self.recv_pool()
+        self.assertEqual(submission["params"][1], "first")
+        sent = next(r for name, r in self.events.events if name == "submitted")
+        self.assertEqual((sent["sequence"], sent["difficulty"]), (1, "1000000"))
+
     async def test_request_reconnect_discards_peer_redirect(self):
         self.send(method="client.reconnect", params=["untrusted.invalid", 1234])
         with self.assertRaisesRegex(bridge.Reconnect, "pool requested reconnect"):

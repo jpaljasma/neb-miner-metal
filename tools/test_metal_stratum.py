@@ -169,6 +169,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
     serial, next_id = 0, 3
     last_model = None
     buffered_job = None
+    buffered_received_utc = None
     pool_read = asyncio.create_task(reader.readline())
     miner_read = asyncio.create_task(read_miner(miner_in))
     job_deadline = time.monotonic() + 20
@@ -191,7 +192,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
         hint_key = digest
         monitor.event("tess_hint")
 
-    async def dispatch(job, target_diff, rolled=False):
+    async def dispatch(job, target_diff, rolled=False, received_utc=None):
         nonlocal serial, last_model, job_deadline, hint_key
         slot, digest = job[11], job[10]
         model = models[slot].get(digest)
@@ -223,7 +224,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
             monitor.event("first_job")
         job_deadline = time.monotonic() + JOB_TIMEOUT_S
         monitor.event("job", slot=job[11], height=job[9], clean=bool(job[8]) and not rolled,
-                      sequence=serial, rolled=rolled, difficulty=str(target_diff))
+                      sequence=serial, rolled=rolled, difficulty=str(target_diff), notify_read_utc=received_utc)
 
     try:
         while True:
@@ -321,6 +322,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                     if len(params) != 15 or difficulty is None or en1 is None:
                         raise ValueError("incomplete Suprnova NEB job")
                     buffered_job = (params, difficulty)
+                    buffered_received_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
                 elif method:
                     if method == "client.reconnect":
                         raise Reconnect("pool requested reconnect")
@@ -332,10 +334,17 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                 if authorized and buffered_job is not None and not draining:
                     latest_job = buffered_job
                     buffered_job = None
-                    await dispatch(*latest_job)
+                    await dispatch(*latest_job, received_utc=buffered_received_utc)
                 await writer.drain()
             if miner_read in ready:
                 kind, payload = miner_read.result()
+                if kind == 6:
+                    # Give the already-pending pool read one event-loop turn. A clean
+                    # notification can follow other buffered messages. Keep this exact
+                    # miner frame until those updates have retired any invalid jobs.
+                    await asyncio.sleep(0)
+                    if pool_read.done():
+                        continue
                 miner_read = asyncio.create_task(read_miner(miner_in))
                 # The miner sends a Share for every hit, including block candidates.
                 # Its following Submit for a block is the same nonce.
@@ -343,10 +352,12 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                     local_id, nonce = struct.unpack("<QI", payload)
                     if local_id in jobs:
                         job_id, timestamp, slot, en2_hex, job_diff = jobs[local_id]
-                        pending[next_id] = (slot, time.monotonic(), job_id, job_diff)
-                        monitor.event("submitted", slot=slot, request=next_id)
+                        sent = time.monotonic()
                         request(writer, next_id, "mining.submit",
                                 [login, job_id, en2_hex, timestamp, f"{nonce:08x}"])
+                        pending[next_id] = (slot, sent, job_id, job_diff)
+                        monitor.event("submitted", slot=slot, request=next_id, sequence=local_id,
+                                      difficulty=str(job_diff), in_flight=len(pending))
                         next_id += 1
                         await writer.drain()
                     else:
