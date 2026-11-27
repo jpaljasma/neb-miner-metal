@@ -24,17 +24,30 @@ mod replay {
         model: &Model,
         ds: &dyn neb_pow::shares::Dataset,
         slot: usize,
+        phase: &str,
         hold: Option<u8>,
     ) -> Result<(), String> {
-        let masks = hold.map_or_else(|| vec![0, 1, 2, 3], |id| vec![0, id]);
-        let pipes: Vec<_> = masks.iter().map(|&m| s.compile_pair_screen(m)).collect::<Result<_, _>>()?;
+        let hot = matches!(phase, "hot" | "hot-confirm");
+        let (masks, blocks, seed): (Vec<u8>, u32, u8) = match (phase, hold) {
+            ("hot", _) => ((0..8).map(|factors| 3 | (factors << 3)).collect(), 64, 73),
+            ("hot-confirm", _) => (vec![3, 11, 19, 27], 128, 149),
+            ("variants", None) => ((0..8).collect(), 32, 39),
+            ("variants", Some(mask)) => {
+                let mut controls = vec![0, mask & 2, mask & 3, mask & 6, mask];
+                controls.sort_unstable();
+                controls.dedup();
+                (controls, 32, 171)
+            }
+            _ => return Err("unknown screen replay".into()),
+        };
+        let pipes: Vec<_> = masks.iter().map(|&m| s.compile_screen_variant(m)).collect::<Result<_, _>>()?;
         let header = [0xb4; 80];
         let mut easy = [0xff; 32];
         easy[31] = 63;
         let mut reference = ShareBuffers::new();
         let mut baseline = None;
-        for p in &pipes {
-            s.use_pair_screen(p)?;
+        for pipe in &pipes {
+            s.use_screen_variant(pipe)?;
             let mut r = s.screen_range(&header, u32::MAX - 4095, 4096, &easy, 2, false)?;
             r.hits.sort_unstable();
             for &nonce in &r.hits {
@@ -66,13 +79,18 @@ mod replay {
             }
             baseline = Some(result);
         }
-        let count = 4 * MINING_SCREEN_CAP;
+        let count = if hot { 8 } else { 4 } * MINING_SCREEN_CAP;
         let mut bound = [0xff; 32];
         bound[29..].fill(0);
-        for block in 0..=32u32 {
-            let mut h = [if hold.is_some() { 171 } else { 39 }; 80];
-            h[..4].copy_from_slice(&block.to_le_bytes());
+        for block in 0..=blocks {
+            let mut h = [seed; 80];
+            let prefix_id = if hot { block / 2 } else { block };
+            h[..4].copy_from_slice(&prefix_id.to_le_bytes());
             h[4] = slot as u8;
+            if hot {
+                // Adjacent blocks can share all first 64 bytes but have a different tail.
+                h[72..76].copy_from_slice(&block.rotate_left(13).to_le_bytes());
+            }
             let mut order: Vec<_> = (0..masks.len()).collect();
             let n = order.len();
             order.rotate_left((block as usize + slot) % n);
@@ -81,7 +99,7 @@ mod replay {
             }
             let mut expected = None;
             for i in order {
-                s.use_pair_screen(&pipes[i])?;
+                s.use_screen_variant(&pipes[i])?;
                 let mut evaluated = 0;
                 let mut hits = vec![];
                 let mut gpu = 0.;
@@ -107,25 +125,67 @@ mod replay {
         Ok(())
     }
 
+    fn lookup_upload(
+        scanner: &MetalScanner,
+        model: &Model,
+        ds: &dyn neb_pow::shares::Dataset,
+        slot: usize,
+    ) -> Result<(), String> {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let table = Table::build(model, ds, threads, Vec::new())?;
+        let bytes = (ds.n() as usize + 1) * size_of::<[u32; 9]>();
+        for block in 0..=32 {
+            let mut order = [false, true];
+            if (block + slot) % 2 == 1 {
+                order.reverse();
+            }
+            let mut previous = None;
+            for mapped in order {
+                let start = Instant::now();
+                let buffer = scanner.benchmark_single_lookup(&table, threads, mapped)?;
+                let ms = start.elapsed().as_secs_f64() * 1000.;
+                if buffer.length() as usize != bytes {
+                    return Err("lookup buffer length differs".into());
+                }
+                // SAFETY: both builders finished all CPU writes before returning this shared buffer.
+                let entries = unsafe { std::slice::from_raw_parts(buffer.contents().cast::<u8>(), bytes) };
+                let digest = blake3::hash(entries);
+                if previous.replace(digest).is_some_and(|other| other != digest) {
+                    return Err("lookup table differs".into());
+                }
+                if block > 0 {
+                    println!("{block},{slot},{},{bytes},{ms:.6}", u8::from(mapped));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<(), String> {
         let args: Vec<_> = std::env::args().skip(1).collect();
         let dispatch = args.len() == 3 && args[2] == "dispatch";
+        let upload = args.len() == 3 && args[2] == "lookup-upload";
         let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
+        let hot = args.get(2).is_some_and(|m| m == "hot" || m == "hot-confirm") && args.len() == 3;
         let hold = if variants && args.len() == 4 {
             let id = args[3].parse::<u8>().map_err(|_| "bad mask")?;
-            if !(1..=3).contains(&id) {
-                return Err("holdout mask must be 1, 2 or 3".into());
+            if !(1..=7).contains(&id) {
+                return Err("holdout mask must be between 1 and 7".into());
             }
             Some(id)
         } else {
             None
         };
-        if args.len() != 2 && !dispatch && !variants {
-            return Err("DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK]]".into());
+        if args.len() != 2 && !dispatch && !variants && !upload && !hot {
+            return Err(
+                "DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm]".into(),
+            );
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
         let sets = load_datasets(Path::new(&args[0]), Some(pin.as_bytes()))?;
-        if variants {
+        if upload {
+            println!("block,slot,mapped,table_bytes,wall_ms");
+        } else if variants || hot {
             println!("block,slot,mask,screened,evaluated,wall_ms,gpu_ms");
         } else if dispatch {
             println!("block,slot,batch,screened,evaluated,wall_ms,gpu_ms");
@@ -141,10 +201,14 @@ mod replay {
                 return Err("snapshot mismatch".into());
             }
             let mut s = MetalScanner::open(ds.clone())?;
+            if upload {
+                lookup_upload(&s, &model, &*ds, slot)?;
+                continue;
+            }
             s.set_weights(&model)?;
-            s.build_combos(if dispatch || variants { 0 } else { 128 })?;
-            if variants {
-                screen_variants(&mut s, &model, &*ds, slot, hold)?;
+            s.build_combos(if dispatch || variants || hot { 0 } else { 128 })?;
+            if variants || hot {
+                screen_variants(&mut s, &model, &*ds, slot, &args[2], hold)?;
                 continue;
             }
             if dispatch {

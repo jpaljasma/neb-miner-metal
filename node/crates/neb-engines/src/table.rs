@@ -151,6 +151,13 @@ impl Table {
     /// zero is the empty digest; entry i+1 holds a live flag and sample i's digest.
     pub fn single_row_lookup(&self, threads: usize) -> Vec<[u32; 9]> {
         let mut out = vec![[0u32; 9]; self.n as usize + 1];
+        self.fill_zeroed_single_row_lookup(threads, &mut out);
+        out
+    }
+
+    /// Fill a zero-initialized destination of n + 1 records. Idle rows keep their zero records.
+    pub fn fill_zeroed_single_row_lookup(&self, threads: usize, out: &mut [[u32; 9]]) {
+        assert_eq!(out.len(), self.n as usize + 1);
         let words = |d: [u8; 32]| blake3::platform::words_from_le_bytes_32(&d);
         out[0][1..].copy_from_slice(&words(self.digest_for_rows(&[], &mut Vec::new())));
         let chunk = (self.n as usize).div_ceil(threads.max(1)).max(1);
@@ -169,7 +176,6 @@ impl Table {
                 });
             }
         });
-        out
     }
 
     fn digest_for_rows(&self, indices: &[u32], acc: &mut Vec<i32>) -> [u8; 32] {

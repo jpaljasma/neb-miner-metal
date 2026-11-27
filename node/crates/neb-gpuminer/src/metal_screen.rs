@@ -7,10 +7,59 @@ pub const SCREEN_CAP: u32 = 262144;
 /// Amortize one synchronous GPU submission across four calibration ranges.
 pub const MINING_SCREEN_CAP: u32 = SCREEN_CAP * 4;
 pub const PROBE_CAP: u32 = 4096;
+const SCALAR_CHACHA: u8 = 1;
+const PAIRS_ONLY: u8 = 2;
+const MAPPED_ARGS: u8 = 4;
+const HEADER_COLUMNS: u8 = 8;
+const HIGH_WORD: u8 = 16;
+const GROUP_ARGS: u8 = 32;
+const DEFAULT_SCREEN: u8 = PAIRS_ONLY | SCALAR_CHACHA | HEADER_COLUMNS;
+type ScreenArgs = [u32; 40];
+
+// Finish three independent BLAKE3 columns on the host. Column 1 stops just
+// before message word 3 (the nonce) enters the second half of its G function.
+fn prepare_header(args: &mut ScreenArgs, header: &[u8; 76], columns: bool) {
+    let mut cv = HASH_IV;
+    blake3::platform::Platform::detect().compress_in_place(
+        &mut cv,
+        header[..64].try_into().unwrap(),
+        64,
+        0,
+        CHUNK_START,
+    );
+    args[..8].copy_from_slice(&cv);
+    for (word, bytes) in args[8..11].iter_mut().zip(header[64..].as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
+    }
+    if !columns {
+        return;
+    }
+    let words = [args[8], args[9], args[10], 0, 0, 0, 0, 0];
+    for i in 0..4 {
+        let mut a = cv[i].wrapping_add(cv[i + 4]).wrapping_add(words[2 * i]);
+        let mut d = (a ^ [0, 0, 16, u32::from(CHUNK_END | ROOT)][i]).rotate_right(16);
+        let mut c = HASH_IV[i].wrapping_add(d);
+        let mut b = (cv[i + 4] ^ c).rotate_right(12);
+        if i != 1 {
+            a = a.wrapping_add(b).wrapping_add(words[2 * i + 1]);
+            d = (d ^ a).rotate_right(8);
+            c = c.wrapping_add(d);
+            b = (b ^ c).rotate_right(7);
+        }
+        args[24 + i] = a;
+        args[28 + i] = b;
+        args[32 + i] = c;
+        args[36 + i] = d;
+    }
+}
 pub struct Screen {
-    fast: ComputePipelineState,
+    pair: ComputePipelineState,
+    general: Option<ComputePipelineState>,
     check: ComputePipelineState,
-    pair_fast: Option<ComputePipelineState>,
+    parameters: Buffer,
+    #[cfg(feature = "metal-bench")]
+    mode: u8,
+    prefix: Option<[u8; 76]>,
     counts: Buffer,
     hits: Buffer,
     records: Buffer,
@@ -23,11 +72,15 @@ pub struct ScreenResult {
     pub records: Vec<[u32; 9]>,
 }
 impl Screen {
-    pub(super) fn variant(device: &Device, check: u8, mask: u8) -> Result<ComputePipelineState, String> {
+    pub(super) fn variant(device: &metal::DeviceRef, check: bool, mask: u8) -> Result<ComputePipelineState, String> {
         let src = format!(
-            "#define CHECK_RECORDS {check}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n{}",
-            mask & 1,
-            (mask >> 1) & 1,
+            "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n{}",
+            u8::from(check),
+            u8::from(mask & SCALAR_CHACHA != 0),
+            u8::from(mask & PAIRS_ONLY != 0),
+            u8::from(mask & HEADER_COLUMNS != 0),
+            u8::from(mask & HIGH_WORD != 0),
+            u8::from(mask & GROUP_ARGS != 0),
             include_str!("../../../../pow/gpu/kep1_screen.metal")
         );
         let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
@@ -35,14 +88,19 @@ impl Screen {
         device.new_compute_pipeline_state_with_function(&f)
     }
     #[cfg(feature = "metal-bench")]
-    pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState) {
-        self.pair_fast = Some(p);
+    pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState, mode: u8) {
+        self.pair = p;
+        self.mode = mode;
     }
     pub fn new(device: &Device) -> Result<Self, String> {
         Ok(Self {
-            fast: Self::variant(device, 0, 0)?,
-            check: Self::variant(device, 1, 0)?,
-            pair_fast: None,
+            pair: Self::variant(device, false, DEFAULT_SCREEN)?,
+            general: None,
+            check: Self::variant(device, true, 0)?,
+            parameters: shared_buffer(device, size_of::<ScreenArgs>())?,
+            #[cfg(feature = "metal-bench")]
+            mode: DEFAULT_SCREEN,
+            prefix: None,
             counts: shared_buffer(device, 8)?,
             hits: shared_buffer(device, MINING_SCREEN_CAP as usize * 4)?,
             records: shared_buffer(device, PROBE_CAP as usize * 36)?,
@@ -71,18 +129,36 @@ impl Screen {
         }
         let tables = rows.combos.as_ref().ok_or("combination tables unavailable")?;
         let single = rows.singles.as_ref().ok_or("single table unavailable")?;
-        let mut args = [0u32; 24];
-        let mut cv = HASH_IV;
-        blake3::platform::Platform::detect().compress_in_place(
-            &mut cv,
-            header[..64].try_into().unwrap(),
-            64,
-            0,
-            CHUNK_START,
-        );
-        args[..8].copy_from_slice(&cv);
-        for (word, bytes) in args[8..11].iter_mut().zip(header[64..76].as_chunks::<4>().0) {
-            *word = u32::from_le_bytes(*bytes);
+        let pipeline = if check {
+            &self.check
+        } else if arity <= 2 {
+            &self.pair
+        } else {
+            match &mut self.general {
+                Some(pipeline) => pipeline,
+                empty @ None => empty.insert(Self::variant(queue.device(), false, 0)?),
+            }
+        };
+        let mut inline_args = [0u32; 40];
+        #[cfg(feature = "metal-bench")]
+        let mode = self.mode;
+        #[cfg(not(feature = "metal-bench"))]
+        let mode = DEFAULT_SCREEN;
+        let columns = mode & HEADER_COLUMNS != 0;
+        let mapped = (columns || mode & MAPPED_ARGS != 0).then_some(&self.parameters);
+        let args = if let Some(buffer) = mapped {
+            // SAFETY: this zero-initialized mapping holds one aligned ScreenArgs. The last
+            // dispatch completed and exclusive access to Screen covers the next submission.
+            unsafe { &mut *buffer.contents().cast::<ScreenArgs>() }
+        } else {
+            &mut inline_args
+        };
+        let prefix: &[u8; 76] = header[..76].try_into().unwrap();
+        if !columns || self.prefix.as_ref() != Some(prefix) {
+            prepare_header(args, prefix, columns);
+            if mapped.is_some() {
+                self.prefix = columns.then_some(*prefix);
+            }
         }
         args[11..16].copy_from_slice(&[
             start,
@@ -91,7 +167,7 @@ impl Screen {
             if arity >= 3 { tables.args[1] } else { 0 },
             tables.args[2],
         ]);
-        args[16..].copy_from_slice(&blake3::platform::words_from_le_bytes_32(bound));
+        args[16..24].copy_from_slice(&blake3::platform::words_from_le_bytes_32(bound));
         // SAFETY: exclusive access; the owned shared buffer holds two aligned u32 counters.
         unsafe {
             self.counts.contents().cast::<[u32; 2]>().write([0, 0]);
@@ -101,14 +177,12 @@ impl Screen {
         autoreleasepool(|| {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(if check {
-                &self.check
-            } else if arity == 2 {
-                self.pair_fast.as_ref().unwrap_or(&self.fast)
+            enc.set_compute_pipeline_state(pipeline);
+            if let Some(buffer) = mapped {
+                enc.set_buffer(0, Some(buffer), 0);
             } else {
-                &self.fast
-            });
-            enc.set_bytes(0, 96, args.as_ptr().cast());
+                enc.set_bytes(0, 96, inline_args.as_ptr().cast());
+            }
             for (i, buf) in
                 [&tables.ranks, single, &tables.values, &self.counts, &self.hits, &self.records].iter().enumerate()
             {

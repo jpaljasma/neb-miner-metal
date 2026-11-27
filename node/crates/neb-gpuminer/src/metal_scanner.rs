@@ -19,6 +19,11 @@ pub use metal_ahead::TessAhead;
 #[path = "metal_screen.rs"]
 mod metal_screen;
 pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, ScreenResult};
+#[cfg(feature = "metal-bench")]
+pub struct PairScreenVariant {
+    pipeline: ComputePipelineState,
+    mode: u8,
+}
 const SCREEN_BATCH_SCALE: u64 = (MINING_SCREEN_CAP / SCREEN_CAP) as u64;
 
 const BATCH: usize = 16384;
@@ -77,6 +82,16 @@ fn shared_buffer(device: &Device, len: usize) -> Result<Buffer, String> {
         return Err("Metal shared buffer has no CPU mapping".into());
     }
     Ok(buffer)
+}
+
+fn mapped_single_lookup(device: &Device, table: &Table, threads: usize) -> Result<Buffer, String> {
+    let count = table.live_rows().len() + 1;
+    let storage = shared_buffer(device, count * size_of::<[u32; 9]>())?;
+    // SAFETY: newBufferWithLength zero-initializes this aligned, count-record mapping.
+    // The CPU workers join before any GPU command can read it.
+    let entries = unsafe { std::slice::from_raw_parts_mut(storage.contents().cast::<[u32; 9]>(), count) };
+    table.fill_zeroed_single_row_lookup(threads, entries);
+    Ok(storage)
 }
 
 struct ModelRows {
@@ -232,6 +247,18 @@ pub struct MetalScanner {
 }
 
 impl MetalScanner {
+    /// Compare lookup construction and upload, including the destination allocation.
+    #[cfg(feature = "metal-bench")]
+    pub fn benchmark_single_lookup(&self, table: &Table, threads: usize, mapped: bool) -> Result<Buffer, String> {
+        if mapped {
+            return mapped_single_lookup(&self.device, table, threads);
+        }
+        let entries = table.single_row_lookup(threads);
+        let storage = shared_buffer(&self.device, std::mem::size_of_val(entries.as_slice()))?;
+        // SAFETY: entries and the new destination have the same byte length and never overlap.
+        unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr(), storage.contents().cast(), entries.len()) };
+        Ok(storage)
+    }
     pub fn open(dataset: SharedDataset) -> Result<Self, String> {
         if dataset.arch() != Arch::Kep1 || dataset.n() == 0 || u64::from(dataset.n()) * STRIDE as u64 > u32::MAX as u64
         {
@@ -672,13 +699,19 @@ impl MetalScanner {
         self.host_mask = flags;
     }
     pub fn compile_pair_screen(&self, mask: u8) -> Result<ComputePipelineState, String> {
-        metal_screen::Screen::variant(&self.device, 0, mask)
+        metal_screen::Screen::variant(&self.device, false, mask & 3)
     }
     pub fn use_pair_screen(&mut self, p: &ComputePipelineState) -> Result<(), String> {
+        self.use_screen_variant(&PairScreenVariant { pipeline: p.clone(), mode: 0 })
+    }
+    pub fn compile_screen_variant(&self, mode: u8) -> Result<PairScreenVariant, String> {
+        Ok(PairScreenVariant { pipeline: metal_screen::Screen::variant(&self.device, false, mode)?, mode })
+    }
+    pub fn use_screen_variant(&mut self, variant: &PairScreenVariant) -> Result<(), String> {
         if self.screen.is_none() {
             self.screen = Some(metal_screen::Screen::new(&self.device)?);
         }
-        self.screen.as_mut().unwrap().set_pair_pipeline(p.clone());
+        self.screen.as_mut().unwrap().set_pair_pipeline(variant.pipeline.clone(), variant.mode);
         Ok(())
     }
     pub fn compile_variant(&self, mask: u8) -> Result<(ComputePipelineState, u64), String> {
@@ -787,13 +820,7 @@ impl Scanner for MetalScanner {
         }
         let try_screen = self.allow_screen && table.idle_rows() * 2 >= self.dataset.n() as usize;
         let singles = if cfg!(feature = "metal-bench") || try_screen || self.host_mask & 4 != 0 {
-            let entries = table.single_row_lookup(threads);
-            let storage = shared_buffer(&self.device, std::mem::size_of_val(entries.as_slice()))?;
-            // SAFETY: storage is new and exactly sized for all plain u32 records.
-            unsafe {
-                std::ptr::copy_nonoverlapping(entries.as_ptr(), storage.contents().cast(), entries.len());
-            }
-            Some(storage)
+            Some(mapped_single_lookup(&self.device, &table, threads)?)
         } else {
             None
         };

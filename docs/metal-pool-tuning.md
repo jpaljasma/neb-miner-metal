@@ -83,7 +83,33 @@ Each of 32 order-balanced blocks per model screened the same 4,194,304 nonces in
 | TESS | +0.39% | −0.35% to +1.16% |
 | Both, equally weighted | +1.09% | +0.57% to +1.61% |
 
-Both variants remain available for benchmarking. The lower confidence bound fell below the +1.5% production threshold on both models. Reproduce the four-way comparison with `metal_selected DATASET SNAPSHOT_DIR variants` and the pair-only holdout with `metal_selected DATASET FRESH_SNAPSHOT_DIR variants 2`.
+Production selective mining now combines the pair-only specialization and scalar ChaCha8. It uses the general shader for triple lookups and an independent vector implementation for its audit records. The earlier pair-only result above motivated inclusion despite the uncertainty. A follow-up 32-block paired replay measured the combined kernel at **+0.83% on Kepler** (90% interval −1.26% to +2.89%) and **−0.45% on TESS** (−1.27% to +0.42%) against the original vector, general-purpose screen. The equal-weight change was +0.19% (−0.84% to +1.22%).
+
+The screen still reserves three local row indices. Reducing that array to two and changing its write guard slowed the vector pair kernel by 6.8% relative to the original general shader in an exploratory run. Moving the original 96-byte dispatch parameters to persistent shared memory alone measured −0.66% across the two models (−1.85% to +0.49%). The production buffer also caches header calculations, as measured below.
+
+Run `metal_selected DATASET SNAPSHOT_DIR variants` for all eight combinations. Mask bits 1, 2 and 4 select scalar ChaCha8, pair-only specialization and mapped parameters respectively. Use `variants 7` on fresh snapshots to compare the combined kernel with its component controls.
+
+### Zero-copy single-row lookup table
+
+Model setup writes digest records directly into the shared Metal buffer. Each model rebuild eliminates a 482,580-byte allocation and copy for Kepler or a 255,240-byte allocation and copy for TESS on the pinned dataset. The table builder writes only live records and the empty digest into the newly zeroed destination. [Metal buffer initialization](https://developer.apple.com/documentation/metal/mtldevice/makebuffer%28length%3Aoptions%3A%29)
+
+In 32 paired rebuilds per model on each of two snapshot pairs, both paths produced byte-identical tables every time. On the holdout, median build-and-upload time went from **18.67 to 18.05 ms on Kepler** and **4.76 to 4.75 ms on TESS**. All setup timing intervals included zero. The allocation and copy savings apply on each rebuild. Run `metal_selected DATASET SNAPSHOT_DIR lookup-upload` to reproduce the comparison.
+
+### Reusing BLAKE3 work across nonces on M1 Max
+
+The pair kernel uses a persistent 160-byte shared argument buffer per scanner. For a new 76-byte header prefix, the CPU computes the BLAKE3 chaining value and the nonce-independent work in the next block's first round. Three columns are complete. The fourth stops where the nonce enters. The GPU reads those states directly for each nonce. Changes to the target, start nonce or pair-table coverage update their own fields each dispatch. A change anywhere in the header prefix refreshes the cached state.
+
+Decred's open-source BLAKE3 miner folds initialization into round one and filters on the high output word. The NEB CUDA table kernel shares common inputs within a block and checks an arbitrary 256-bit target. We adapted these ideas to NEB's shorter header and exact tie handling, then tested the cache, an early high-word comparison, and explicit Metal threadgroup staging. [Decred OpenCL kernel](https://github.com/decred/gominer/blob/68791b06465250db861e8d7ce9c6b5b2ccdb074b/blake3.cl) · [NEB CUDA table kernel](https://github.com/SilasEigen/neb/blob/v1.0.9/pow/gpu/nebhash2_table_cuda.cu)
+
+The eight-way screen used 64 order-balanced blocks per model. Explicit threadgroup staging alone cost 4.79% across the models (90% interval −5.71% to −3.85%). Four configurations that used no staging then ran on different model snapshots and headers for 128 paired blocks per model. Each block covered 8,388,608 raw nonces per configuration. Each pair had identical evaluated counts and hit sets. Parity probes exercised the last nonce, exact ticket targets and just-below targets.
+
+| Holdout gain over the scalar pair kernel | Kepler | TESS | Both, equally weighted |
+| --- | ---: | ---: | ---: |
+| Cache header columns in unified memory | **+2.29%** (+0.79% to +3.80%) | **+1.33%** (+0.34% to +2.34%) | **+1.81%** (+0.95% to +2.64%) |
+| Filter on the high word first | +1.29% | −0.15% | +0.57% (−0.38% to +1.53%) |
+| Combine the cache and high-word filter | +0.78% | +0.32% | +0.55% (−0.30% to +1.45%) |
+
+The cache alone gave the highest confirmed throughput on both models and exceeded the current 0.5% point-estimate cutoff. Run `metal_selected DATASET SNAPSHOT_DIR hot` for the factorial and `metal_selected DATASET FRESH_SNAPSHOT_DIR hot-confirm` for confirmation. Save the CSV output and run `python3 tools/analyze_metal_factorial.py FILE.csv` for the paired estimates and 90% intervals. The masks add bits 8, 16 and 32 for cached columns, high-word filtering and threadgroup staging to the scalar pair baseline of 3.
 
 ## Ahead-of-job TESS preparation
 
