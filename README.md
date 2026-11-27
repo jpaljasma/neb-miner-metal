@@ -1,6 +1,8 @@
-# neb-miner-metal
+# Mining NEB on Apple silicon
 
-Mine NEB on an Apple silicon Mac using Metal. The GPU mines both NEB models, Kepler and TESS, and reuses calculations in the Mac's unified memory. Before submitting a share, the miner checks it against NEB's CPU reference. The terminal dashboard shows each model's hashrate, accepted shares and stale shares separately.
+If you have an Apple silicon Mac, its GPU can contribute to NEB’s Kepler and TESS models. `neb-miner-metal` takes jobs from NEB’s existing work service, computes tickets with Metal, and checks each candidate against the upstream CPU reference before submitting a share. [Upstream NEB](https://github.com/SilasEigen/neb)
+
+We’d like to contribute this backend to NEB. A starting point for upstream review is the exhaustive scanner behind the optional `metal` Cargo feature. Run the offline benchmark below to compare every byte of 8,192 GPU tickets per model against the CPU on the same jobs. The selective pool scanner and terminal dashboard can be evaluated separately. [Metal scanner](node/crates/neb-gpuminer/src/metal_scanner.rs) · [CPU parity benchmark](docs/metal-benchmark.md)
 
 ## M1 Max scan speed
 
@@ -11,7 +13,7 @@ On a 32-core M1 Max with 64 GB of unified memory, neb-miner-metal scanned **146.
 | Kepler | 695,146 tickets/s | 4,737 tickets/s |
 | TESS | 676,496 tickets/s | 4,989 tickets/s |
 
-Our miner builds a lookup table before scanning. That took 306 ms for Kepler and 164 ms for TESS. The other miner loaded each model in 0.003 ms and computed gradients during the scan. [Benchmark and replay commands](docs/metal-benchmark.md#matched-metal-scan-on-november-27-2026) · [Peer implementation](https://github.com/SilasEigen/neb/pull/2)
+The two miners make different tradeoffs. This backend spent 306 ms on Kepler and 164 ms on TESS building lookup tables before scanning. Pramonoutomo’s implementation loaded each model in 0.003 ms and computed gradients during the scan. Its public Metal proposal made this same-Mac comparison possible. [Benchmark and replay commands](docs/metal-benchmark.md#matched-metal-scan-on-november-27-2026) · [Upstream Metal proposal](https://github.com/SilasEigen/neb/pull/2)
 
 ## Pool mining on M1 Max
 
@@ -19,7 +21,7 @@ In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s**
 
 When the model changes, a dedicated two-row Metal kernel builds the pair lookup table. On a held-out Kepler model it cut table construction from **5.07 s to 2.48 s**. [Model-turnover benchmarks](docs/metal-turnover.md)
 
-![NEB terminal dashboard with Kepler mining, the last TESS job, and recent pool replies](docs/images/metal-miner-dashboard.png)
+![NEB dashboard mining over TCP, with Kepler active, the last TESS job and recent pool replies](docs/images/metal-miner-dashboard.png)
 
 ## Try it on your Mac
 
