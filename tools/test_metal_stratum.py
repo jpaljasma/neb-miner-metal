@@ -282,9 +282,16 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                     else:
                         error = msg.get("error")
                         code = error[0] if isinstance(error, list) and error and type(error[0]) is int else None
-                        monitor.event("rejected", slot=slot, request=number, code=code, latency_ms=latency_ms)
+                        current_diff = latest_job[1] if latest_job is not None else share_diff
+                        monitor.event("rejected", slot=slot, request=number, code=code, latency_ms=latency_ms,
+                                      difficulty=str(share_diff), current_job_difficulty=str(current_diff))
                         if code == 21:
                             for local_id in [i for i, v in jobs.items() if v[0] == old_job_id]:
+                                del jobs[local_id]
+                        elif code == 23 and current_diff > share_diff:
+                            # A harder job arrived before the reply. Retire that old target,
+                            # preserve the replacement job and continue receiving pending replies.
+                            for local_id in [i for i, v in jobs.items() if v[0] == old_job_id and v[4] == share_diff]:
                                 del jobs[local_id]
                         else:
                             raise RuntimeError(f"pool rejected share (code {code})")

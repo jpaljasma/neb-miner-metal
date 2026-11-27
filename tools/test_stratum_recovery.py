@@ -186,6 +186,29 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError,"code 23"):
             await self.task
 
+    async def test_late_low_difficulty_reply_preserves_retarget_and_pending_shares(self):
+        await self.job()
+        self.hit(1, 7)
+        self.hit(1, 8)
+        old, pending = await self.recv_pool(), await self.recv_pool()
+        self.send(method="mining.set_difficulty", params=[2_000_000])
+        self.notify("first", False)  # Reused pool job ID, new target and extranonce.
+        await asyncio.wait_for(self.to_worker.sent.get(), 1)
+        self.send(id=old["id"], result=False, error=[23, "low difficulty", None])
+        self.send(id=pending["id"], result=True)
+        self.hit(1, 9)
+        self.hit(2, 10)
+        current = await self.recv_pool()
+        self.assertEqual(current["params"][-1], "0000000a")
+        self.send(id=current["id"], result=True)
+        self.notify("next", False)
+        await asyncio.wait_for(self.to_worker.sent.get(), 1)
+        self.assertEqual(self.events.slots[0], 2)
+        rejected = [r for name, r in self.events.events if name == "rejected"]
+        self.assertEqual([(r["code"], r["difficulty"], r["current_job_difficulty"]) for r in rejected],
+                         [(23, "1000000", "2000000")])
+        self.assertFalse(any(name == "unconfirmed" for name, _ in self.events.events))
+
     async def test_authorization_refusal_stops(self):
         self.send(id=2, result=False, error=[24, "invalid", None])
         with self.assertRaisesRegex(RuntimeError, "refused payout"):
