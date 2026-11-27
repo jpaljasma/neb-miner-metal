@@ -2,6 +2,29 @@
 
 A mainnet NEB miner for the Apple M1 Max GPU, based on [SilasEigen/neb v1.0.9](https://github.com/SilasEigen/neb/tree/v1.0.9). It connects to the NEB node work service and mines both KEP1 slots, Kepler and TESS. The node and the miner use the upstream C implementation to verify candidate shares.
 
+## M1 Max performance
+
+On a 32-core M1 Max GPU with 64 GB of unified memory, the miner completed **57.79 billion tickets in one uninterrupted 30-minute Suprnova session** on November 26, 2026. Rates below count fully evaluated tickets. A nonce that the GPU screens out contributes zero to the rate.
+
+| Model | Offline exhaustive | Offline selective | Live selective | Time on live jobs | Pool shares accepted / submitted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kepler | 1.37 M tickets/s | 24.75 M tickets/s | 23.22 M tickets/s | 26m 12s | 59 / 59 |
+| TESS | 1.44 M tickets/s | 138.62 M tickets/s | 93.30 M tickets/s | 3m 48s | 19 / 20 |
+
+The offline columns are medians over 24 timed blocks on two fixed, trained models with prepared tables. Live rates divide completed tickets by the time the pool assigned to each slot, including model changes and table setup. The combined live rate was **32.11 M tickets/s**. All 79 submissions received replies. The pool rejected one TESS share as stale when it announced a new Kepler job. The session finished on one TLS connection with zero verifier mismatches, CPU fallbacks or reconnects.
+
+**What improved throughput.** Each gain below was confirmed against the preceding implementation on fresh work, with the two slots weighted equally. The percentages describe separate experiments.
+
+| Change | Confirmed throughput gain (90% interval) |
+| --- | ---: |
+| Use 256 threads per nonce, exact 16-bit vector arithmetic and precomputed sums for zero gradients | +34.1% (+32.5% to +35.8%) |
+| Overlap Rust sample preparation with GPU execution using eight in-flight Metal commands | +24.0% (+22.5% to +25.6%) |
+| Generate samples for four keys at once in Rust and shorten Metal dot products to the nonzero rows | +55.5% (+53.5% to +57.6%) |
+
+Selective mining adds the largest gain on sparse models. The GPU computes exact tickets from cached digests for zero, one or two nonzero sample gradients. It builds the pair table in slices so mining can continue during setup. Reusing valid pairs across Kepler model changes cut median setup from **3.79 s to 3.05 s** in 12 paired trials. The miner can choose exhaustive scanning when the expected gain would take too long to repay setup. [Tuning measurements and replay commands](docs/metal-pool-tuning.md)
+
+On the original fixed genesis jobs, the first Metal release ran **2.04× as fast on Kepler and 2.01× on TESS** as the optimized 10-thread CPU miner. All 16,384 tickets matched the CPU reference byte for byte. [CPU comparison and methodology](docs/metal-benchmark.md)
+
 ## Build and run on macOS
 
 Install a stable arm64 Rust toolchain and the Xcode Command Line Tools. From the repository root:
@@ -21,6 +44,8 @@ node/target/release/neb-miner-metal --dataset build/neb-datasets.bin --node 127.
 
 ### Test a real Suprnova TLS share
 
+For a timed session with a named worker, reconnect handling, local event logs and the adaptive GPU screen, see [M1 Max pool operation and measured optimizations](docs/metal-pool-tuning.md).
+
 Save your own public NEB payout address on one line in `.neb-payout-address` at the repository root. Git ignores this file. Set `POOL_URL` to your Suprnova NEB TLS endpoint, then run:
 
 ```sh
@@ -31,7 +56,7 @@ The Python 3 adapter connects with certificate and hostname verification, starts
 
 ### How the Metal engine works
 
-The host precomputes upstream's per-sample gradient table when it loads a slot's weights. Each Metal threadgroup combines the 16 samples for one nonce. The 128 threads share signed-byte factors for the dense layers and reduce the result into eight digest lanes. When all sampled errors for a dense output are zero, the kernel computes that output's contribution as an arithmetic sum. The CPU handles sample selection, BLAKE3 hashing and target comparison.
+The host builds upstream's per-sample gradient table when a slot's weights change. In exhaustive mode, Rust selects the samples and each 256-thread Metal group reduces their gradients to an eight-lane digest. Rust hashes the digest and checks the target. In selective pool mode, the GPU selects the samples, looks up the digest for eligible combinations, hashes the ticket and checks the target. Both paths send candidate shares to the CPU reference for verification.
 
 The work-service client rechecks every candidate with the CPU reference before submitting it, probes each new model and audits ongoing scans. A failed parity check switches the affected slot to the reference scanner. The executable prints attempts/s, submitted shares, accepted blocks, mismatches and fallbacks.
 
