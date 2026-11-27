@@ -62,12 +62,21 @@ pub struct FoundBlock {
 /// Counters shown by the status line.
 #[derive(Default)]
 pub struct Stats {
+    /// Measured work in each of the two mainnet slots (GPU workers).
+    pub gpu_slots: [GpuSlotStats; 2],
     pub attempts: AtomicU64,
     pub shares: AtomicU64,
     pub blocks: AtomicU64,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub jobs: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct GpuSlotStats {
+    pub evaluated: AtomicU64,
+    pub screened: AtomicU64,
+    pub work_ns: AtomicU64,
 }
 
 impl Stats {
@@ -150,6 +159,11 @@ pub struct Session {
 }
 
 impl Session {
+    /// Private adapter extension, enabled only for a pool client that can roll
+    /// extranonce2. The standard solo work-service path never emits this frame.
+    pub fn request_adapter_header(&self, job_id: u64) {
+        send(&self.shared, &frames::frame(8, &job_id.to_le_bytes()));
+    }
     /// The job to mine, once the node has sent a model and a job.
     pub fn current(&self) -> Option<Arc<Unit>> {
         self.shared.current.lock().expect("current job").clone()

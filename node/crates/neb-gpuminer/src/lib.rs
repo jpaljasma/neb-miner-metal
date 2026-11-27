@@ -77,6 +77,28 @@ pub const BATCH: u32 = 1 << 16;
 pub trait Scanner: Send {
     /// Most nonces one scan can cover.
     fn capacity(&self) -> u32;
+    fn mining_capacity(&self) -> u32 {
+        self.capacity().min(BATCH)
+    }
+    /// A production batch may screen out nonces before evaluating the ticket.
+    /// Report only complete attempts. scan() remains exhaustive for verification.
+    fn mine_range(
+        &mut self,
+        _model: &Model,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        bound: &[u8; 32],
+    ) -> Result<(Vec<u32>, u32), String> {
+        Ok((self.scan(header, start, count, bound)?, count))
+    }
+    fn request_roll(&self) -> bool {
+        false
+    }
+    /// Audit cadence for this scanner's batch size.
+    fn audit_batches(&self) -> u64 {
+        AUDIT_BATCHES
+    }
     /// Sets the model the next scans are evaluated on: `w1` is 128 x 784 and `w2` 10 x 128, row-major.
     fn set_model(&mut self, w1: &[i8], w2: &[i8]) -> Result<(), String>;
     /// Sets the model the next scans are evaluated on, of any architecture. The default unpacks a v1 model for
@@ -272,6 +294,7 @@ pub fn spawn_worker_with_fallback(
         // the model loaded on each lane's scanner
         let mut lanes: Vec<(Lane, Option<Arc<Model>>)> = lanes.into_iter().map(|l| (l, None)).collect();
         let mut batches = 0u64;
+        let mut requested_roll = None;
         // Replaces the scanner by the fallback and uploads `model` to it; false when that is impossible.
         let switch =
             |scanner: &mut Box<dyn Scanner>, fallback: &mut Option<Fallback>, model: &Model, why: &str| -> bool {
@@ -305,11 +328,7 @@ pub fn spawn_worker_with_fallback(
                 thread::sleep(Duration::from_millis(200));
                 continue;
             };
-            let batch = scanner.capacity().min(BATCH);
-            let Some((start, count)) = unit.take_nonces(batch) else {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            };
+            let batch_started = std::time::Instant::now();
             let reference = |buffers: &mut ShareBuffers, header: &mut [u8; 80], nonce: u32| {
                 header[76..80].copy_from_slice(&nonce.to_le_bytes());
                 buffers.ticket(&unit.model, &**dataset, blake3::hash(header).as_bytes())
@@ -339,14 +358,27 @@ pub fn spawn_worker_with_fallback(
                     }
                 }
             }
-            let confirmed = loop {
-                let hits = match scanner.scan(&unit.header, start, count, &unit.share_target.0) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("neb-miner-gpu: the device failed: {e}");
-                        return;
-                    }
-                };
+            if session.superseded(&unit) {
+                continue;
+            }
+            let batch = scanner.mining_capacity();
+            let Some((start, count)) = unit.take_nonces(batch) else {
+                if scanner.request_roll() && requested_roll != Some(unit.job.id) {
+                    session.request_adapter_header(unit.job.id);
+                    requested_roll = Some(unit.job.id);
+                }
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let (confirmed, evaluated) = loop {
+                let (hits, evaluated) =
+                    match scanner.mine_range(&unit.model, &unit.header, start, count, &unit.share_target.0) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("neb-miner-gpu: the device failed: {e}");
+                            return;
+                        }
+                    };
                 let mut header = unit.header;
                 let mut confirmed = Vec::with_capacity(hits.len());
                 let mut refused = 0u64;
@@ -361,7 +393,7 @@ pub fn spawn_worker_with_fallback(
                 mismatches.fetch_add(refused, Ordering::Relaxed);
                 batches += 1;
                 let mut fault = refused > 0;
-                if fallback.is_some() && !fault && batches.is_multiple_of(AUDIT_BATCHES) {
+                if fallback.is_some() && !fault && batches.is_multiple_of(scanner.audit_batches()) {
                     let nonce = start + count / 2;
                     let want = reference(&mut buffers, &mut header, nonce);
                     fault = !probe_ticket(&mut **scanner, &header, nonce, &want).unwrap_or(false);
@@ -372,10 +404,15 @@ pub fn spawn_worker_with_fallback(
                     }
                     continue; // scan the batch again with K0
                 }
-                break confirmed;
+                break (confirmed, evaluated);
             };
-            session.stats().attempts.fetch_add(count as u64, Ordering::Relaxed);
-            attempts.fetch_add(count as u64, Ordering::Relaxed);
+            session.stats().attempts.fetch_add(evaluated as u64, Ordering::Relaxed);
+            if let Some(slot_stats) = session.stats().gpu_slots.get(unit.slot as usize) {
+                slot_stats.evaluated.fetch_add(evaluated as u64, Ordering::Relaxed);
+                slot_stats.screened.fetch_add(count as u64, Ordering::Relaxed);
+                slot_stats.work_ns.fetch_add(batch_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            attempts.fetch_add(evaluated as u64, Ordering::Relaxed);
             if session.superseded(&unit) {
                 continue;
             }

@@ -126,6 +126,11 @@ impl Table {
         self.live.iter().filter(|&&l| !l).count()
     }
 
+    /// True for each dataset row with a nonzero gradient at the prepared weights.
+    pub fn live_rows(&self) -> &[bool] {
+        &self.live
+    }
+
     /// The rows, to build the next table in the same memory.
     pub fn into_spare(self) -> Vec<u8> {
         self.rows
@@ -134,14 +139,47 @@ impl Table {
     /// The attempt `key`: its digest, its ticket and its sample indices. `acc` is the scratch of the caller; after
     /// the call its first `arch.weights()` entries are the clipped gradient of the attempt.
     pub fn eval(&self, key: &[u8; 32], acc: &mut Vec<i32>) -> TableEval {
+        let indices = share_indices(key, self.n);
+        let digest = self.digest_for_rows(&indices, acc);
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&digest);
+        input[32..].copy_from_slice(key);
+        TableEval { digest, ticket: *blake3::hash(&input).as_bytes(), indices }
+    }
+
+    /// Exact digest lookup for attempts with zero or one live sample. Entry
+    /// zero is the empty digest; entry i+1 holds a live flag and sample i's digest.
+    pub fn single_row_lookup(&self, threads: usize) -> Vec<[u32; 9]> {
+        let mut out = vec![[0u32; 9]; self.n as usize + 1];
+        let words = |d: [u8; 32]| blake3::platform::words_from_le_bytes_32(&d);
+        out[0][1..].copy_from_slice(&words(self.digest_for_rows(&[], &mut Vec::new())));
+        let chunk = (self.n as usize).div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|scope| {
+            for (part, entries) in out[1..].chunks_mut(chunk).enumerate() {
+                let words = &words;
+                scope.spawn(move || {
+                    let mut acc = Vec::new();
+                    for (j, entry) in entries.iter_mut().enumerate() {
+                        let i = part * chunk + j;
+                        if self.live[i] {
+                            entry[0] = 1;
+                            entry[1..].copy_from_slice(&words(self.digest_for_rows(&[i as u32], &mut acc)));
+                        }
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    fn digest_for_rows(&self, indices: &[u32], acc: &mut Vec<i32>) -> [u8; 32] {
         let weights = self.arch.weights();
         if acc.len() < weights {
             acc.resize(weights, 0);
         }
         let acc = &mut acc[..weights];
         acc.fill(0);
-        let indices = share_indices(key, self.n);
-        for &i in &indices {
+        for &i in indices {
             if !self.live[i as usize] {
                 continue;
             }
@@ -187,13 +225,11 @@ impl Table {
                 }
             }
         }
-        let mut input = [0u8; 64];
+        let mut digest = [0u8; 32];
         for (k, lane) in lanes.iter().enumerate() {
-            input[4 * k..4 * k + 4].copy_from_slice(&lane.to_le_bytes());
+            digest[4 * k..4 * k + 4].copy_from_slice(&lane.to_le_bytes());
         }
-        input[32..].copy_from_slice(key);
-        let digest = input[..32].try_into().expect("32 bytes");
-        TableEval { digest, ticket: *blake3::hash(&input).as_bytes(), indices }
+        digest
     }
 }
 

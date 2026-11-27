@@ -21,7 +21,7 @@ mod apple {
     };
 
     const DATASET_HASH: &str = "790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72";
-    const USAGE: &str = "neb-miner-metal --dataset FILE (--node HOST:PORT | --benchmark)";
+    const USAGE: &str = "neb-miner-metal --dataset FILE (--node HOST:PORT [--stratum-adapter] | --benchmark)";
 
     // A failing model probe or audit makes the existing GPU worker rescan the
     // range with this scanner. A small capacity keeps subsequent CPU batches short.
@@ -54,10 +54,24 @@ mod apple {
         }
     }
 
-    fn mine(addr: &str, datasets: Vec<SharedDataset>) -> Result<(), String> {
+    fn log_slots(stats: &neb_cpuminer::Stats, kind: &str) {
+        for (slot, s) in stats.gpu_slots.iter().enumerate() {
+            eprintln!(
+                "slot {kind} {slot} evaluated {} screened {} work_ns {}",
+                s.evaluated.load(Ordering::Relaxed),
+                s.screened.load(Ordering::Relaxed),
+                s.work_ns.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    fn mine(addr: &str, datasets: Vec<SharedDataset>, selective: bool) -> Result<(), String> {
         let mut lanes = Vec::new();
         for dataset in datasets {
-            let scanner = MetalScanner::open(dataset.clone())?;
+            let mut scanner = MetalScanner::open(dataset.clone())?;
+            if selective {
+                scanner.enable_screen();
+            }
             let cpu_data = dataset.clone();
             let fallback = Box::new(move || {
                 Ok(Box::new(ReferenceScanner { dataset: cpu_data, model: None, scratch: ShareBuffers::new() })
@@ -77,19 +91,29 @@ mod apple {
                 let s = handle.stats();
                 let n = s.attempts.load(Ordering::Relaxed);
                 eprintln!(
-                    "{:.0} attempts/s, shares {}, accepted blocks {}, mismatches {}, fallbacks {}",
+                    "{:.0} attempts/s, shares {}, accepted blocks {}, mismatches {}, fallbacks {}, attempts {}",
                     (n - last.1) as f64 / last.0.elapsed().as_secs_f64(),
                     s.shares.load(Ordering::Relaxed),
                     s.accepted.load(Ordering::Relaxed),
                     mismatches.load(Ordering::Relaxed),
-                    fallbacks.load(Ordering::Relaxed)
+                    fallbacks.load(Ordering::Relaxed),
+                    n
                 );
                 last = (Instant::now(), n);
+                log_slots(s, "sample");
             }
         }
         let reason = if handle.stopped() { handle.stats().disconnect_message() } else { "scanner stopped" };
+        let stats = handle.stats().clone();
         handle.stop();
         worker.join().map_err(|_| "scanner panicked")?;
+        log_slots(&stats, "final");
+        eprintln!(
+            "final attempts {}, mismatches {}, fallbacks {}",
+            stats.attempts.load(Ordering::Relaxed),
+            mismatches.load(Ordering::Relaxed),
+            fallbacks.load(Ordering::Relaxed)
+        );
         Err(reason.into())
     }
 
@@ -209,7 +233,7 @@ mod apple {
 
     pub fn run() -> Result<(), String> {
         let mut args = std::env::args().skip(1);
-        let (mut dataset, mut node, mut bench) = (None, None, false);
+        let (mut dataset, mut node, mut bench, mut selective) = (None, None, false, false);
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--help" | "-h" => {
@@ -219,13 +243,14 @@ mod apple {
                 "--dataset" => dataset = Some(args.next().ok_or(USAGE)?),
                 "--node" => node = Some(args.next().ok_or(USAGE)?),
                 "--benchmark" => bench = true,
+                "--stratum-adapter" => selective = true,
                 _ => return Err(USAGE.into()),
             }
         }
         let pin = blake3::Hash::from_hex(DATASET_HASH).unwrap();
         let datasets = load_datasets(Path::new(&dataset.ok_or(USAGE)?), Some(pin.as_bytes()))?;
         match (node, bench) {
-            (Some(addr), false) => mine(&addr, datasets),
+            (Some(addr), false) => mine(&addr, datasets, selective),
             (None, true) => benchmark(datasets),
             _ => Err(USAGE.into()),
         }
