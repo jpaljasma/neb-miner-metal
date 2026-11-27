@@ -3,10 +3,30 @@ import asyncio
 from collections import Counter
 import json
 import struct
+import ssl
 import unittest
 from unittest.mock import patch
 
 import test_metal_stratum as bridge
+
+
+class Transport(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_tcp_and_verified_tls(self):
+        with patch("asyncio.open_connection") as connect:
+            await bridge.open_pool("stratum+tcp://pool.example:1234")
+            connect.assert_awaited_once_with("pool.example", 1234, limit=262144)
+            connect.reset_mock()
+            await bridge.open_pool("stratum+ssl://pool.example:5678")
+            self.assertEqual(connect.await_args.kwargs["server_hostname"], "pool.example")
+            ctx = connect.await_args.kwargs["ssl"]
+            self.assertTrue(ctx.check_hostname)
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    async def test_tls_failure_never_retries_plaintext(self):
+        with patch("asyncio.open_connection", side_effect=ssl.SSLCertVerificationError()) as connect:
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                await bridge.open_pool("stratum+ssl://pool.example:1234")
+            self.assertEqual(connect.await_count, 1)
 
 
 class Sink:

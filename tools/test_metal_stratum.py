@@ -261,7 +261,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                     en1 = bytes.fromhex(en1_text)
                     if len(en1) != 8 or en2_size != 8:
                         raise ValueError("unexpected NEB extranonce size")
-                    request(writer, 2, "mining.authorize", [login, "d=1000000"])
+                    request(writer, 2, "mining.authorize", [login, "x"])
                 elif number == 2 and not method:
                     if msg.get("result") is not True or msg.get("error"):
                         raise RuntimeError("pool refused payout address")
@@ -368,7 +368,7 @@ async def session(pool, worker, login, monitor, hint_sink=None):
                     monitor.event("unexpected_miner_frame", kind=kind)
     except (ValueError, KeyError, TypeError, IndexError, OverflowError, DecimalException, struct.error) as error:
         # A broken or truncated notification invalidates the job/target context;
-        # discard it and establish a new subscription at the configured TLS endpoint.
+        # discard it and establish a new subscription at the configured pool endpoint.
         raise Reconnect(f"invalid protocol frame ({type(error).__name__})") from error
     finally:
         if hint_timer is not None:
@@ -380,21 +380,32 @@ async def session(pool, worker, login, monitor, hint_sink=None):
         await asyncio.gather(pool_read, miner_read, return_exceptions=True)
 
 
+async def open_pool(endpoint):
+    url = urlsplit(endpoint)
+    if (url.scheme not in ("stratum+ssl", "stratum+tcp") or not url.hostname or not url.port
+            or url.username is not None or url.password is not None or url.path or url.query or url.fragment):
+        raise ValueError("expected stratum+tcp://host:port or stratum+ssl://host:port")
+    options = {}
+    if url.scheme == "stratum+ssl":
+        ctx = ssl.create_default_context()
+        if not ctx.get_ca_certs() and Path("/etc/ssl/cert.pem").is_file():
+            ctx.load_verify_locations("/etc/ssl/cert.pem")
+        options = dict(ssl=ctx, server_hostname=url.hostname)
+    return await asyncio.wait_for(asyncio.open_connection(url.hostname, url.port, limit=262144, **options), 12)
+
+
 async def run(args, monitor):
-    url = urlsplit(args.pool)
-    if url.scheme != "stratum+ssl" or not url.hostname or not url.port or url.username or url.password or url.path:
-        raise RuntimeError("expected stratum+ssl://host:port")
     login = args.address_file.read_text().strip()
     if not re.fullmatch(r"neb1[a-z0-9]{58}", login):
         raise RuntimeError("invalid NEB address in local file")
     if args.worker:
         login += "." + args.worker
-    ctx = ssl.create_default_context()
-    if not ctx.get_ca_certs() and Path("/etc/ssl/cert.pem").is_file():
-        ctx.load_verify_locations("/etc/ssl/cert.pem")
-    pool = await asyncio.wait_for(asyncio.open_connection(
-        url.hostname, url.port, ssl=ctx, server_hostname=url.hostname, limit=262144), 12)
-    monitor.event("tls_connected", tls=pool[1].get_extra_info("ssl_object").version())
+    pool = await open_pool(args.pool)
+    tls = pool[1].get_extra_info("ssl_object")
+    if tls is None:
+        monitor.event("tcp_connected")
+    else:
+        monitor.event("tls_connected", tls=tls.version())
     connected = asyncio.get_running_loop().create_future()
 
     def connect(reader, writer):

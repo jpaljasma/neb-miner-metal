@@ -148,7 +148,7 @@ def markdown(reports):
             if "ms_after_nearest_clean_notify" in e:
                 detail += f", Δ to nearest clean job (height {e['nearest_clean_height']}): {e['ms_after_nearest_clean_notify']:+.1f} ms"
             print(f"- {e['utc']} · {e['event']} · connection {e['connection']} · {slot} {detail}")
-        print("\nCode 21 means stale or unknown job. Extranonce rolls reuse the TLS connection. "
+        print("\nCode 21 means stale or unknown job. Extranonce rolls reuse the pool connection. "
               "Completed MH/s uses completed tickets divided by the slot’s job time. "
               "Accepted shares measure pool acknowledgements. Balances and payouts follow the pool's accounting.\n")
         for e in r["full_path_decisions"]:
