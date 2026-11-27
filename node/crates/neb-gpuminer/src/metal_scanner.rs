@@ -52,7 +52,19 @@ fn table_pipeline(device: &Device, mask: u8, build: u8, read: u8) -> Result<(Com
 enum PairBuilder {
     General,
     TwoRows,
+    #[cfg(feature = "metal-bench")]
     MaskedTwoRows,
+    DirectMaskedTwoRows,
+}
+impl PairBuilder {
+    fn uses_output_mask(self) -> bool {
+        match self {
+            Self::General | Self::TwoRows => false,
+            #[cfg(feature = "metal-bench")]
+            Self::MaskedTwoRows => true,
+            Self::DirectMaskedTwoRows => true,
+        }
+    }
 }
 
 fn table_pipeline_options(
@@ -63,6 +75,21 @@ fn table_pipeline_options(
     pair_style: PairBuilder,
 ) -> Result<(ComputePipelineState, u64), String> {
     let width = if mask & 16 == 0 { 128 } else { 256 };
+    if pair_style == PairBuilder::DirectMaskedTwoRows {
+        table_pipeline_geometry(device, mask, build, read, pair_style, 64, 1)
+    } else {
+        table_pipeline_geometry(device, mask, build, read, pair_style, width, 0)
+    }
+}
+fn table_pipeline_geometry(
+    device: &Device,
+    mask: u8,
+    build: u8,
+    read: u8,
+    pair_style: PairBuilder,
+    width: u64,
+    access: u8,
+) -> Result<(ComputePipelineState, u64), String> {
     let source = format!(
         "#define ROW_CACHE {}\n#define PLANAR {}\n#define SHORT_MAC {}\n#define SALT_BASE {}\n#define SINGLE_CACHE {}\n#define COMPACT_ROWS {}\n#define SHORT_DOT {}\n#define COMBO_BUILD {build}\n#define COMBO_READ {read}\n#define GROUP_WIDTH {width}\n{SHADER}",
         mask & 1,
@@ -80,9 +107,9 @@ fn table_pipeline_options(
         source
     };
     let source = format!(
-        "#define TWO_ROW {}\n#define PAIR_OUTPUT_MASK {}\n{}",
+        "#define TWO_ROW {}\n#define PAIR_OUTPUT_MASK {}\n#define DIRECT_FACTORS {access}\n{}",
         u8::from(pair_style != PairBuilder::General),
-        u8::from(pair_style == PairBuilder::MaskedTwoRows),
+        u8::from(pair_style.uses_output_mask()),
         source
     );
     let library = device.new_library_with_source(&source, &CompileOptions::new())?;
@@ -189,7 +216,7 @@ struct Combos {
     values: Buffer,
     args: [u32; 3], // ready pairs, ready triple prefix, allocated pairs
     ids: Buffer,
-    pair_builder: ComputePipelineState,
+    pair_builder: (ComputePipelineState, u64),
     active_outputs: Option<Buffer>,
     support: Option<Buffer>,
     host_ranks: Vec<u32>,
@@ -219,7 +246,7 @@ impl Combos {
         &self,
         queue: &CommandQueue,
         rows: &Buffer,
-        pipeline: &ComputePipelineState,
+        pipeline: &(ComputePipelineState, u64),
         offset: usize,
         first: usize,
         len: usize,
@@ -229,7 +256,7 @@ impl Combos {
             let args = [first as u32, limit as u32, self.args[2]];
             let cmd = queue.new_command_buffer();
             let e = cmd.new_compute_command_encoder();
-            e.set_compute_pipeline_state(pipeline);
+            e.set_compute_pipeline_state(&pipeline.0);
             if let Some(active) = &self.active_outputs {
                 e.set_buffer(10, Some(active), 0);
             }
@@ -242,7 +269,7 @@ impl Combos {
                 e.set_buffer(8, Some(&hint.old_values), 0);
                 e.set_bytes(9, 4, (&hint.ready as *const u32).cast());
             }
-            e.dispatch_thread_groups(MTLSize::new(len as u64, 1, 1), MTLSize::new(256, 1, 1));
+            e.dispatch_thread_groups(MTLSize::new(len as u64, 1, 1), MTLSize::new(pipeline.1, 1, 1));
             e.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -377,7 +404,7 @@ impl MetalScanner {
             device,
             recover_triples: false,
             skip_unchanged: false,
-            pair_style: PairBuilder::MaskedTwoRows,
+            pair_style: PairBuilder::DirectMaskedTwoRows,
             #[cfg(feature = "metal-bench")]
             skipped_bytes: 0,
             #[cfg(feature = "metal-bench")]
@@ -779,15 +806,10 @@ impl MetalScanner {
         let values = shared_buffer(&self.device, bytes.max(32))?;
         let reuse = self.reuse_hint.take();
         let build_kind = if reuse.is_some() { 4 } else { 2 };
-        let (pair_builder, _) =
+        let pair_builder =
             table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0, self.pair_style)?;
-        let (active_outputs, support) = turnover_tables(
-            &self.device,
-            rows,
-            ids,
-            self.pair_style == PairBuilder::MaskedTwoRows,
-            self.recover_triples,
-        )?;
+        let (active_outputs, support) =
+            turnover_tables(&self.device, rows, ids, self.pair_style.uses_output_mask(), self.recover_triples)?;
         rows.combos = Some(Combos {
             rank_buffers,
             values,
@@ -809,7 +831,7 @@ impl MetalScanner {
             if count == 0 {
                 continue;
             }
-            let (p, _) = table_pipeline_options(
+            let p = table_pipeline_options(
                 &self.device,
                 DEFAULT_VARIANT | 64 | 128,
                 if arity == 2 { build_kind } else { arity },

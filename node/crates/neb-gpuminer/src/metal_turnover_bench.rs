@@ -2,6 +2,9 @@
 use super::*;
 
 impl MetalScanner {
+    pub fn use_direct_pair_builder(&mut self) {
+        self.pair_style = PairBuilder::DirectMaskedTwoRows;
+    }
     pub fn turnover_experiment(&mut self, mask: u8, masked_builder: bool) {
         self.recover_triples = mask & 1 != 0;
         self.skip_unchanged = mask & 4 != 0;
@@ -44,7 +47,7 @@ impl MetalScanner {
         let bytes = unsafe { std::slice::from_raw_parts(r.buffer.contents().cast(), r.buffer.length() as usize) };
         (self.copy_seconds, self.skipped_bytes, blake3::hash(bytes))
     }
-    pub fn benchmark_builders(&mut self, slot: usize) -> Result<(), String> {
+    pub fn benchmark_builders(&mut self, slot: usize, geometry: bool, seed: u8) -> Result<(), String> {
         let r = self.rows.as_ref().ok_or("missing rows")?;
         let c = r.combos.as_ref().ok_or("missing pairs")?;
         let count = c.args[2].min(65536) as usize;
@@ -52,21 +55,39 @@ impl MetalScanner {
             return Err("builder replay requires a populated masked model".into());
         }
         let kind = if c.reuse.is_some() { 4 } else { 2 };
-        let pipelines = [PairBuilder::General, PairBuilder::TwoRows, PairBuilder::MaskedTwoRows]
-            .into_iter()
-            .map(|style| table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, kind, 0, style))
-            .collect::<Result<Vec<_>, _>>()?;
+        let pipelines = if geometry {
+            (0..9)
+                .map(|id| {
+                    table_pipeline_geometry(
+                        &self.device,
+                        DEFAULT_VARIANT | 64 | 128,
+                        kind,
+                        0,
+                        PairBuilder::MaskedTwoRows,
+                        [256, 128, 64][id / 3],
+                        (id % 3) as u8,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            [PairBuilder::General, PairBuilder::TwoRows, PairBuilder::MaskedTwoRows]
+                .into_iter()
+                .map(|style| table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, kind, 0, style))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         for block in 0..=48usize {
-            let first = (block as u64 * 2654435761 % u64::from(c.args[2] - count as u32 + 1)) as usize;
-            let mut order = [0, 1, 2];
-            order.rotate_left((block + slot) % 3);
-            if block / 3 % 2 == 1 {
+            let offset = if geometry { u64::from(seed) } else { 0 };
+            let first = ((block as u64 + offset) * 2654435761 % u64::from(c.args[2] - count as u32 + 1)) as usize;
+            let arms = pipelines.len();
+            let mut order: Vec<_> = (0..arms).collect();
+            order.rotate_left((block + slot) % arms);
+            if block / arms % 2 == 1 {
                 order.reverse();
             }
             let mut expected = None;
             for style in order {
                 let start = std::time::Instant::now();
-                c.slice(&self.queue, &r.buffer, &pipelines[style].0, 0, first, count, 0)?;
+                c.slice(&self.queue, &r.buffer, &pipelines[style], 0, first, count, 0)?;
                 let ms = start.elapsed().as_secs_f64() * 1000.;
                 // SAFETY: the completed command wrote this bounded slice of the allocated pair table.
                 let digest = blake3::hash(unsafe {

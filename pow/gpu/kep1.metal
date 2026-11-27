@@ -4,6 +4,9 @@ using namespace metal;
 #if TWO_ROW && (COMBO_BUILD != 2 || !SALT_BASE)
 #error The two-row builder requires a pair table and precomputed zero-gradient salts.
 #endif
+#if DIRECT_FACTORS && !TWO_ROW || DIRECT_FACTORS == 2 && !PAIR_OUTPUT_MASK
+#error Direct factors require a two-row builder; the input-first variant also requires its output mask.
+#endif
 
 // KEP1 rows from neb_engines::table, padded to a four-byte boundary by the host.
 // Conv layers have 40 int, 640 short, 40 short and 640 short entries.
@@ -55,8 +58,11 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
                         uint tid [[thread_index_in_threadgroup]],
                         uint group [[threadgroup_position_in_grid]],
                         uint width [[threads_per_threadgroup]]) {
-    #if TWO_ROW
+    #if TWO_ROW && DIRECT_FACTORS
+    #define PAIR(e) char2(as_type<char>(rows[OFFSET(0)+factor_offset+(e)]),as_type<char>(rows[OFFSET(1)+factor_offset+(e)]))
+    #elif TWO_ROW
     threadgroup char2 pair_factors[factor_count];
+    #define PAIR(e) pair_factors[e]
     #elif PLANAR
     threadgroup char4 planes[4][factor_count];
     #define FACTOR(e,w) planes[w][e]
@@ -145,11 +151,11 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
     #else
     #define OFFSET(b) (ROW(b) * row_bytes)
     #endif
-    #if TWO_ROW
+    #if TWO_ROW && !DIRECT_FACTORS
     for (uint e = tid; e < factor_count; e += width)
         pair_factors[e]=char2(as_type<char>(rows[OFFSET(0)+factor_offset+e]),
                               as_type<char>(rows[OFFSET(1)+factor_offset+e]));
-    #else
+    #elif !TWO_ROW
     for (uint e = tid; e < factor_count; e += width) {
         for (uint w = 0; w < 4; w++) {
             char4 v;
@@ -159,7 +165,9 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
         }
     }
     #endif
+    #if !DIRECT_FACTORS
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    #endif
     uint sum = 0;
     for (uint f = tid; f < 1360; f += width) {
         int grad = 0;
@@ -179,6 +187,17 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
     sum += terms*(7919u*5 + tid) + width*terms*(terms-1)/2;
     #endif
     #if TWO_ROW
+    #if DIRECT_FACTORS == 2
+    uint mask=active_outputs[component[0]] | active_outputs[component[1]];
+    for (uint q=tid;q<768;q+=width) {
+        short2 input=short2(PAIR(32+q));
+        for(uint active=mask;active;active &= active-1){
+            uint o=ctz(active), weight=o*768+q;
+            short2 p=input*short2(PAIR(o));
+            sum+=fold(int(p.x)+p.y,5,weight)-(7919u*5+weight);
+        }
+    }
+    #else
     #if PAIR_OUTPUT_MASK
     uint active=active_outputs[component[0]] | active_outputs[component[1]];
     while (active) {
@@ -186,16 +205,17 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
         active &= active-1;
     #else
     for (uint o=0;o<32;o++) {
-        if (!any(pair_factors[o]!=0)) continue;
+        if (!any(PAIR(o)!=0)) continue;
     #endif
         for (uint q=tid;q<768;q+=width) {
-            short2 p=short2(pair_factors[o])*short2(pair_factors[32+q]);
+            short2 p=short2(PAIR(o))*short2(PAIR(32+q));
             uint weight=o*768+q;
             sum+=fold(int(p.x)+p.y,5,weight)-(7919u*5+weight);
         }
     }
+    #endif
     if (tid<64) {
-        short2 p=short2(pair_factors[800+tid/32])*short2(pair_factors[802+tid%32]);
+        short2 p=short2(PAIR(800+tid/32))*short2(PAIR(802+tid%32));
         sum+=fold(int(p.x)+p.y,6,tid);
     }
     #else

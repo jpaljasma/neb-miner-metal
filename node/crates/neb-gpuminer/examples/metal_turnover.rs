@@ -194,6 +194,15 @@ mod apple {
             return Err("invalid mask".into());
         }
         let seed = parse(7)?;
+        if args[0] == "paired-direct" {
+            let ordered = if seed.is_multiple_of(2) { ["short", "direct-short"] } else { ["direct-short", "short"] };
+            let mut job = args.to_vec();
+            for name in ordered {
+                job[0] = name.into();
+                run(&job, sets)?;
+            }
+            return Ok(());
+        }
         if args[0] == "paired-short" {
             let mut order = [0, 2, 6];
             order.rotate_left((seed as usize + slot) % 3);
@@ -244,13 +253,17 @@ mod apple {
         }
         let mut s = MetalScanner::for_slot(ds.clone(), slot)?;
         s.turnover_experiment(mask, parse(6)? != 0);
+        let direct = args[0].starts_with("direct-");
+        if direct {
+            s.use_direct_pair_builder();
+        }
         s.set_weights(&old)?;
         s.build_combos(0)?;
         s.turnover_evaluate(&[19; 80], 0, MINING_SCREEN_CAP, &[0; 32])?;
-        if args[0] == "builders" {
+        if args[0] == "builders" || args[0] == "geometry" {
             s.set_weights(&new)?;
             s.turnover_prepare_prefix()?;
-            return s.benchmark_builders(slot);
+            return s.benchmark_builders(slot, args[0] == "geometry", seed);
         }
         if args[0] == "extra" {
             s.set_weights(&new)?;
@@ -306,7 +319,7 @@ mod apple {
             println!("extra,{slot},{confirmed}");
             return Ok(());
         }
-        let window = args[0] == "window" || args[0] == "short";
+        let window = matches!(args[0].as_str(), "window" | "short" | "direct-short");
         if window {
             s.enable_screen();
         }
@@ -321,7 +334,7 @@ mod apple {
         if window {
             let mut total = 0u64;
             for mark in [5., 15., 30.] {
-                if args[0] == "short" && mark > 5. {
+                if args[0].ends_with("short") && mark > 5. {
                     break;
                 }
                 while clock.elapsed().as_secs_f64() < mark {
@@ -339,7 +352,7 @@ mod apple {
                     total += u64::from(evaluated);
                 }
                 println!(
-                    "window,{slot},{mask},{seed},{mark},{:.6},{total},{setup:.6},{:?}",
+                    "window,{slot},{mask},{seed},{mark},{:.6},{total},{setup:.6},{:?},{direct}",
                     clock.elapsed().as_secs_f64(),
                     s.mining_mode()
                 );
@@ -406,7 +419,8 @@ fn main() -> Result<(), String> {
             oracle(ds.as_ref(), &model(Path::new(&args[2]), slot)?, Path::new(&args[4]))
         }
         #[cfg(target_os = "macos")]
-        "fixed" | "window" | "short" | "paired-short" | "copy" | "builders" | "extra" => apple::run(&args, &sets),
+        "fixed" | "direct-fixed" | "window" | "short" | "direct-short" | "paired-direct" | "paired-short" | "copy"
+        | "builders" | "geometry" | "extra" => apple::run(&args, &sets),
         _ => Err("unknown experiment".into()),
     }
 }
