@@ -34,6 +34,12 @@ inline void qr(thread uint4 &a, thread uint4 &b, thread uint4 &c, thread uint4 &
     a+=b;d=rot(d^a,16);c+=d;b=rot(b^c,12);
     a+=b;d=rot(d^a,8);c+=d;b=rot(b^c,7);
 }
+#if SCALAR_CHACHA
+inline void qr_word(thread uint &a, thread uint &b, thread uint &c, thread uint &d) {
+    a+=b; d=rotate(d^a,16u); c+=d; b=rotate(b^c,12u);
+    a+=b; d=rotate(d^a,8u); c+=d; b=rotate(b^c,7u);
+}
+#endif
 inline uint triangular_index(uint b) { return b*(b+1)/2; }
 inline uint triple_index(uint c) { return c*(c+1)*(c+2)/6; }
 
@@ -56,6 +62,19 @@ kernel void lookup_screen(constant const uint *args [[buffer(0)]],
     Hash cv={uint4(args[0],args[1],args[2],args[3]),uint4(args[4],args[5],args[6],args[7])};
     Hash key=compress(cv,block,16,10);
     uint4 init=uint4(0x61707865,0x3320646e,0x79622d32,0x6b206574);
+    #if SCALAR_CHACHA
+    uint x[16]={init.x,init.y,init.z,init.w,key.lo.x,key.lo.y,key.lo.z,key.lo.w,
+                key.hi.x,key.hi.y,key.hi.z,key.hi.w,0,0,0,0};
+    #pragma clang loop unroll(full)
+    for(uint r=0;r<4;r++){
+        qr_word(x[0],x[4],x[8],x[12]); qr_word(x[1],x[5],x[9],x[13]);
+        qr_word(x[2],x[6],x[10],x[14]); qr_word(x[3],x[7],x[11],x[15]);
+        qr_word(x[0],x[5],x[10],x[15]); qr_word(x[1],x[6],x[11],x[12]);
+        qr_word(x[2],x[7],x[8],x[13]); qr_word(x[3],x[4],x[9],x[14]);
+    }
+    uint4 words[4]={uint4(x[0],x[1],x[2],x[3])+init,uint4(x[4],x[5],x[6],x[7])+key.lo,
+                    uint4(x[8],x[9],x[10],x[11])+key.hi,uint4(x[12],x[13],x[14],x[15])};
+    #else
     uint4 a=init,b=key.lo,c=key.hi,d=0;
     #pragma clang loop unroll(full)
     for(uint r=0;r<4;r++){
@@ -63,11 +82,15 @@ kernel void lookup_screen(constant const uint *args [[buffer(0)]],
         qr(a,b,c,d); b=b.wxyz;c=c.zwxy;d=d.yzwx;
     }
     uint4 words[4]={a+init,b+key.lo,c+key.hi,d};
+    #endif
     uint live=0, row=0, ids[3]={};
     for(uint j=0;j<16;j++) {
         uint id=mulhi(words[j/4][j%4],args[12]);
         uint rank=ranks[id];
         if(rank!=0xffffffffu) {
+            #if PAIRS_ONLY
+            if(live==2){ live=3; break; }
+            #endif
             if(live<3) ids[live]=rank;
             live++; row=id;
             if(live>3) break;
@@ -80,7 +103,9 @@ kernel void lookup_screen(constant const uint *args [[buffer(0)]],
         uint entry=triangular_index(max(ids[0],ids[1]))+min(ids[0],ids[1]);
         eligible=entry<args[13];
         if(eligible) digest=combos+8*entry;
-    } else if(live==3) {
+    }
+    #if !PAIRS_ONLY
+    else if(live==3) {
         uint high=max(max(ids[0],ids[1]),ids[2]);
         eligible=high<args[14];
         if(eligible) {
@@ -89,6 +114,7 @@ kernel void lookup_screen(constant const uint *args [[buffer(0)]],
             digest=combos+8*(args[15]+triple_index(high)+triangular_index(middle)+low);
         }
     }
+    #endif
     uint evaluated=simd_sum(uint(eligible));
     if(lane==0 && evaluated) atomic_fetch_add_explicit(counts,evaluated,memory_order_relaxed);
     #if CHECK_RECORDS

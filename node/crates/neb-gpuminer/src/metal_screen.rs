@@ -2,34 +2,49 @@
 //! tickets; nonces outside the prepared pair/triple domain earn no work.
 use super::*;
 
+/// Size of the fixed calibration/replay range.
 pub const SCREEN_CAP: u32 = 262144;
+/// Amortize one synchronous GPU submission across four calibration ranges.
+pub const MINING_SCREEN_CAP: u32 = SCREEN_CAP * 4;
 pub const PROBE_CAP: u32 = 4096;
 pub struct Screen {
     fast: ComputePipelineState,
     check: ComputePipelineState,
+    pair_fast: Option<ComputePipelineState>,
     counts: Buffer,
     hits: Buffer,
     records: Buffer,
 }
 pub struct ScreenResult {
+    #[cfg(feature = "metal-bench")]
+    pub gpu_s: f64,
     pub evaluated: u32,
     pub hits: Vec<u32>,
     pub records: Vec<[u32; 9]>,
 }
 impl Screen {
+    pub(super) fn variant(device: &Device, check: u8, mask: u8) -> Result<ComputePipelineState, String> {
+        let src = format!(
+            "#define CHECK_RECORDS {check}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n{}",
+            mask & 1,
+            (mask >> 1) & 1,
+            include_str!("../../../../pow/gpu/kep1_screen.metal")
+        );
+        let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
+        let f = lib.get_function("lookup_screen", None)?;
+        device.new_compute_pipeline_state_with_function(&f)
+    }
+    #[cfg(feature = "metal-bench")]
+    pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState) {
+        self.pair_fast = Some(p);
+    }
     pub fn new(device: &Device) -> Result<Self, String> {
-        let compile = |check: u8| {
-            let src =
-                format!("#define CHECK_RECORDS {check}\n{}", include_str!("../../../../pow/gpu/kep1_screen.metal"));
-            let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
-            let f = lib.get_function("lookup_screen", None)?;
-            device.new_compute_pipeline_state_with_function(&f)
-        };
         Ok(Self {
-            fast: compile(0)?,
-            check: compile(1)?,
+            fast: Self::variant(device, 0, 0)?,
+            check: Self::variant(device, 1, 0)?,
+            pair_fast: None,
             counts: shared_buffer(device, 8)?,
-            hits: shared_buffer(device, SCREEN_CAP as usize * 4)?,
+            hits: shared_buffer(device, MINING_SCREEN_CAP as usize * 4)?,
             records: shared_buffer(device, PROBE_CAP as usize * 36)?,
         })
     }
@@ -47,7 +62,11 @@ impl Screen {
         arity: u8,
         check: bool,
     ) -> Result<ScreenResult, String> {
-        if count == 0 || count > SCREEN_CAP || (check && count > PROBE_CAP) || start.checked_add(count - 1).is_none() {
+        if count == 0
+            || count > MINING_SCREEN_CAP
+            || (check && count > PROBE_CAP)
+            || start.checked_add(count - 1).is_none()
+        {
             return Err("invalid screen range".into());
         }
         let tables = rows.combos.as_ref().ok_or("combination tables unavailable")?;
@@ -77,10 +96,18 @@ impl Screen {
         unsafe {
             self.counts.contents().cast::<[u32; 2]>().write([0, 0]);
         }
+        #[cfg(feature = "metal-bench")]
+        let mut gpu_s = 0.0;
         autoreleasepool(|| {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(if check { &self.check } else { &self.fast });
+            enc.set_compute_pipeline_state(if check {
+                &self.check
+            } else if arity == 2 {
+                self.pair_fast.as_ref().unwrap_or(&self.fast)
+            } else {
+                &self.fast
+            });
             enc.set_bytes(0, 96, args.as_ptr().cast());
             for (i, buf) in
                 [&tables.ranks, single, &tables.values, &self.counts, &self.hits, &self.records].iter().enumerate()
@@ -94,6 +121,13 @@ impl Screen {
             if cmd.status() != MTLCommandBufferStatus::Completed {
                 return Err("Metal nonce screen failed".to_string());
             }
+            #[cfg(feature = "metal-bench")]
+            {
+                // SAFETY: a completed MTLCommandBuffer exposes f64 GPU timestamps.
+                #[allow(unexpected_cfgs)]
+                let (begin, end): (f64, f64) = unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+                gpu_s = end - begin;
+            }
             Ok(())
         })?;
         // SAFETY: the completed command wrote these two counters. Their values
@@ -102,7 +136,7 @@ impl Screen {
         if evaluated > count || found > evaluated {
             return Err("invalid GPU screen count".into());
         }
-        // SAFETY: found <= count <= SCREEN_CAP. No writer is in flight.
+        // SAFETY: found <= count <= MINING_SCREEN_CAP. No writer is in flight.
         let hits = unsafe { std::slice::from_raw_parts(self.hits.contents().cast::<u32>(), found as usize) }.to_vec();
         let records = if check {
             // SAFETY: count <= PROBE_CAP and the validation pipeline wrote one record per input.
@@ -110,6 +144,12 @@ impl Screen {
         } else {
             Vec::new()
         };
-        Ok(ScreenResult { evaluated, hits, records })
+        Ok(ScreenResult {
+            evaluated,
+            hits,
+            records,
+            #[cfg(feature = "metal-bench")]
+            gpu_s,
+        })
     }
 }

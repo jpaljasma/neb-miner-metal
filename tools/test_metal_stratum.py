@@ -89,6 +89,9 @@ async def miner_log(proc, monitor):
             monitor.event("miner_final", attempts=attempts, mismatches=mismatches, fallbacks=fallbacks)
         else:
             monitor.event("miner_message", message=re.sub(r"neb1[a-zA-Z0-9.\-_]+", "[redacted]", msg)[:300])
+            if msg.startswith("ignored early TESS model:"):
+                monitor.event("tess_hint_ignored")
+                continue
             if "switching to the fallback scanner" in msg:
                 raise RuntimeError("miner switched to CPU fallback")
             if "mismatch" in msg.lower():
@@ -149,7 +152,7 @@ async def read_miner(reader):
     return message[0], message[1:]
 
 
-async def session(pool, worker, login, monitor):
+async def session(pool, worker, login, monitor, hint_sink=None):
     reader, writer = pool
     miner_in, miner_out = worker
     kind, hello = await asyncio.wait_for(read_miner(miner_in), timeout=10)
@@ -160,7 +163,8 @@ async def session(pool, worker, login, monitor):
     await writer.drain()
     authorized = False
     en1, en2_size, difficulty = None, None, None
-    models, jobs, pending = {}, {}, {}
+    models, jobs, pending = {0: {}, 1: {}}, {}, {}
+    confirmed_models = {}
     nonce_prefix = secrets.randbits(56)
     serial, next_id = 0, 3
     last_model = None
@@ -170,12 +174,34 @@ async def session(pool, worker, login, monitor):
     job_deadline = time.monotonic() + 20
     draining = False
     latest_job = None
+    hint_timer = None
+    hint_key = None
+
+    def offer_hint(digest, packed):
+        nonlocal hint_key
+        if (draining or not authorized or latest_job is None or latest_job[0][11] != 0 or
+                digest in (hint_key, confirmed_models.get(1)) or
+                hint_sink is None or hint_sink.is_closing() or
+                hint_sink.transport.get_write_buffer_size() > 0):
+            return
+        try:
+            hint_sink.write(hash_bytes(digest) + packed)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        hint_key = digest
+        monitor.event("tess_hint")
 
     async def dispatch(job, target_diff, rolled=False):
-        nonlocal serial, last_model, job_deadline
-        digest, model = models[job[11]]
-        if digest != job[10]:
+        nonlocal serial, last_model, job_deadline, hint_key
+        slot, digest = job[11], job[10]
+        model = models[slot].get(digest)
+        if model is None:
             raise ValueError("pool job references an unknown model")
+        confirmed_models[slot] = digest
+        if slot == 1:
+            hint_key = None
+            if hint_timer is not None:
+                hint_timer.cancel()
         if job[8] and not rolled:
             jobs.clear()
         if len(jobs) >= 16:
@@ -196,7 +222,8 @@ async def session(pool, worker, login, monitor):
             monitor.started = time.monotonic()
             monitor.event("first_job")
         job_deadline = time.monotonic() + JOB_TIMEOUT_S
-        monitor.event("job", slot=job[11], height=job[9], clean=bool(job[8]) and not rolled, sequence=serial, rolled=rolled)
+        monitor.event("job", slot=job[11], height=job[9], clean=bool(job[8]) and not rolled,
+                      sequence=serial, rolled=rolled, difficulty=str(target_diff))
 
     try:
         while True:
@@ -242,10 +269,11 @@ async def session(pool, worker, login, monitor):
                     monitor.event("authorized")
                 elif number in pending and not method:
                     slot, sent, old_job_id, share_diff = pending.pop(number)
+                    latency_ms = round((time.monotonic() - sent) * 1000, 2)
                     if msg.get("result") is True and not msg.get("error"):
                         monitor.slots[slot] += 1
                         monitor.event("accepted", slot=slot, request=number, difficulty=str(share_diff),
-                                      latency_ms=round((time.monotonic()-sent)*1000, 2))
+                                      latency_ms=latency_ms)
                         if not monitor.duration:
                             return
                         if monitor.reconnect_test and not pending and time.monotonic()-monitor.started >= 60:
@@ -254,7 +282,7 @@ async def session(pool, worker, login, monitor):
                     else:
                         error = msg.get("error")
                         code = error[0] if isinstance(error, list) and error and type(error[0]) is int else None
-                        monitor.event("rejected", slot=slot, request=number, code=code)
+                        monitor.event("rejected", slot=slot, request=number, code=code, latency_ms=latency_ms)
                         if code == 21:
                             for local_id in [i for i, v in jobs.items() if v[0] == old_job_id]:
                                 del jobs[local_id]
@@ -271,8 +299,17 @@ async def session(pool, worker, login, monitor):
                     if slot not in (0, 1) or len(packed) != 13000:
                         raise ValueError("unexpected mainnet model")
                     # decode_model in the miner verifies this hash before accepting the model frame.
-                    models[slot] = (digest, frame(7, bytes([slot]) + hash_bytes(digest) + packed))
+                    entries = models[slot]
+                    if digest not in entries and len(entries) >= 3:
+                        del entries[next(k for k in entries if k != confirmed_models.get(slot))]
+                    entries[digest] = frame(7, bytes([slot]) + hash_bytes(digest) + packed)
                     monitor.event("model", slot=slot)
+                    if slot == 1 and hint_sink is not None and confirmed_models.get(1) != digest:
+                        if hint_timer is not None:
+                            hint_timer.cancel()
+                        # An ordinary Model+Job usually arrives together. Only
+                        # prepare when the prior Kepler job is still active.
+                        hint_timer = asyncio.get_running_loop().call_later(0.1, offer_hint, digest, packed)
                 elif method == "mining.notify":
                     if len(params) != 15 or difficulty is None or en1 is None:
                         raise ValueError("incomplete Suprnova NEB job")
@@ -317,7 +354,9 @@ async def session(pool, worker, login, monitor):
                         job_deadline = deadline
                         monitor.event("extranonce_roll")
                 elif kind == 4:
-                    monitor.event("block_candidate")
+                    candidate_id, = struct.unpack_from("<Q", payload)
+                    job = jobs.get(candidate_id)
+                    monitor.event("block_candidate", sequence=candidate_id, slot=job[2] if job else None)
                 else:
                     monitor.event("unexpected_miner_frame", kind=kind)
     except (ValueError, KeyError, TypeError, IndexError, OverflowError, DecimalException, struct.error) as error:
@@ -325,6 +364,8 @@ async def session(pool, worker, login, monitor):
         # discard it and establish a new subscription at the configured TLS endpoint.
         raise Reconnect(f"invalid protocol frame ({type(error).__name__})") from error
     finally:
+        if hint_timer is not None:
+            hint_timer.cancel()
         for number, (slot, _, _, _) in pending.items():
             monitor.event("unconfirmed", request=number, slot=slot)
         for task in (pool_read, miner_read):
@@ -361,7 +402,9 @@ async def run(args, monitor):
         async with await asyncio.start_server(connect, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             proc = await asyncio.create_subprocess_exec(str(args.miner), "--dataset", str(args.dataset),
-                *(["--stratum-adapter"] if args.selective else []), "--node", f"127.0.0.1:{port}", stderr=asyncio.subprocess.PIPE)
+                *(["--stratum-adapter"] if args.selective else []), *(["--tess-ahead"] if args.tess_ahead else []),
+                "--node", f"127.0.0.1:{port}", stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if args.tess_ahead else None)
             monitor.event("miner_started", pid=proc.pid)
             log_reader = asyncio.create_task(miner_log(proc, monitor))
             exited = asyncio.create_task(proc.wait())
@@ -376,7 +419,7 @@ async def run(args, monitor):
                 exited.cancel()
                 await asyncio.gather(exited, return_exceptions=True)
         try:
-            active = asyncio.create_task(session(pool, worker, login, monitor))
+            active = asyncio.create_task(session(pool, worker, login, monitor, proc.stdin))
             try:
                 done, _ = await asyncio.wait([log_reader, active], return_when=asyncio.FIRST_COMPLETED)
                 if log_reader in done and not active.done():
@@ -449,6 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--duration", type=float, help="mine for this many seconds from first dispatched job")
     parser.add_argument("--selective", action="store_true", help="validate and select GPU sparse screening per model")
+    parser.add_argument("--tess-ahead", action="store_true", help="prepare early TESS weights while Kepler is active")
     parser.add_argument("--worker", help="Suprnova worker suffix")
     parser.add_argument("--log", type=Path, help="new JSONL event log")
     parser.add_argument("--test-reconnect", action="store_true", help="exercise one reconnect after a confirmed share")
@@ -457,6 +501,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=Path, default=ROOT / "build/neb-datasets.bin")
     parser.add_argument("--miner", type=Path, default=ROOT / "node/target/release/neb-miner-metal")
     args = parser.parse_args()
+    if args.tess_ahead and not args.selective:
+        parser.error("--tess-ahead requires --selective")
     if args.worker and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", args.worker):
         parser.error("invalid worker name")
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):

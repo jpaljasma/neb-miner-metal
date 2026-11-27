@@ -21,7 +21,8 @@ mod apple {
     };
 
     const DATASET_HASH: &str = "790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72";
-    const USAGE: &str = "neb-miner-metal --dataset FILE (--node HOST:PORT [--stratum-adapter] | --benchmark)";
+    const USAGE: &str =
+        "neb-miner-metal --dataset FILE (--node HOST:PORT [--stratum-adapter [--tess-ahead]] | --benchmark)";
 
     // A failing model probe or audit makes the existing GPU worker rescan the
     // range with this scanner. A small capacity keeps subsequent CPU batches short.
@@ -65,10 +66,13 @@ mod apple {
         }
     }
 
-    fn mine(addr: &str, datasets: Vec<SharedDataset>, selective: bool) -> Result<(), String> {
+    fn mine(addr: &str, datasets: Vec<SharedDataset>, selective: bool, tess_ahead: bool) -> Result<(), String> {
         let mut lanes = Vec::new();
-        for dataset in datasets {
+        for (slot, dataset) in datasets.into_iter().enumerate() {
             let mut scanner = MetalScanner::open(dataset.clone())?;
+            if slot == 1 && tess_ahead {
+                scanner.enable_tess_ahead().listen();
+            }
             if selective {
                 scanner.enable_screen();
             }
@@ -233,7 +237,7 @@ mod apple {
 
     pub fn run() -> Result<(), String> {
         let mut args = std::env::args().skip(1);
-        let (mut dataset, mut node, mut bench, mut selective) = (None, None, false, false);
+        let (mut dataset, mut node, mut bench, mut selective, mut tess_ahead) = (None, None, false, false, false);
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--help" | "-h" => {
@@ -244,13 +248,14 @@ mod apple {
                 "--node" => node = Some(args.next().ok_or(USAGE)?),
                 "--benchmark" => bench = true,
                 "--stratum-adapter" => selective = true,
+                "--tess-ahead" => tess_ahead = true,
                 _ => return Err(USAGE.into()),
             }
         }
         let pin = blake3::Hash::from_hex(DATASET_HASH).unwrap();
         let datasets = load_datasets(Path::new(&dataset.ok_or(USAGE)?), Some(pin.as_bytes()))?;
         match (node, bench) {
-            (Some(addr), false) => mine(&addr, datasets, selective),
+            (Some(addr), false) if !tess_ahead || selective => mine(&addr, datasets, selective, tess_ahead),
             (None, true) => benchmark(datasets),
             _ => Err(USAGE.into()),
         }

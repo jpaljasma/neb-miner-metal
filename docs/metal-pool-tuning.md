@@ -50,6 +50,8 @@ In selective pool mode the miner verifies the screen on every new model and comp
 
 ### Incremental model changes
 
+The startup trial uses the production selective dispatch size. When exhaustive scanning wins the 30-second budget but the fully built screen is predicted to beat it by at least 25%, the worker can revisit that decision on a long-lived model. It first spends 15 seconds doing exhaustive work. It then budgets one second of incremental building per eight additional seconds of full scanning. At successive table coverage levels it probes the actual completed-ticket rate. A partial table must beat measured exhaustive throughput by 60% to cover continuing construction, or a complete table by 5%. A successful switch requires a fresh CPU audit. Missing, invalid or unprofitable tables keep the exhaustive path. Probe attempts are excluded from the miner's reported rate.
+
 On a later pair of same-slot transitions, 23.6% of the Kepler pair entries and 4.8% of TESS entries were eligible for reuse. The host compares each new live row's complete packed gradient/factor bytes with that dataset row at the previous model. The GPU can copy an old digest only if both rows are identical, both previous ranks exist, and the old pair index falls inside the completed prefix of the previous table. Changed pairs are computed from the new model. Old storage is released when the new pair table finishes. A transition with less than 10% potential reuse takes the fresh-build route.
 
 In 12 crossover trials on the Kepler transition, median total model setup fell from 3.790 to 3.051 seconds (19.5% less elapsed time). The two-sided 90% paired interval for setup **speedup** was +23.9% to +25.4%. CPU checks compared both eligibility and full selected ticket bytes. On TESS the gate stayed off: 0.885 versus 0.876 seconds, inside the 1.5% selection threshold. Incremental reuse improves job turnover; it does not change the per-nonce scan kernel.
@@ -57,6 +59,39 @@ In 12 crossover trials on the Kepler transition, median total model setup fell f
 ### Scope of the port
 
 The implementation preserves the high-output miner techniques that reproduced locally: exact per-sample caching, GPU-side nonce screening, one-/two-row digests, bounded partial triple replay, incremental pair generation, safe reuse across model versions, per-model selection, overlapping Rust/Metal work, and independent share verification. Pool mode preserves eligible in-flight same-parent jobs and rolls fresh extranonces. The source does not claim equivalent throughput to proprietary miners. The exact triple builder uses direct gradient evaluation; the vendor's private inclusion-exclusion implementation and hardware-specific Ada/Ampere kernels were not available for inspection.
+
+## Selective dispatch size on M1 Max
+
+On the same two captured mainnet models, a separate replay changed only the number of raw nonces per synchronous selective dispatch. Each arm screened the same 4,194,304 nonces per block. After warm-up, order alternated across 32 paired blocks per slot. Each pair had identical evaluated counts and hit sets, and the CPU reference checked every returned hit. The last interval included nonce `u32::MAX`.
+
+| Slot | 262,144 nonces/dispatch | 1,048,576 nonces/dispatch | GPU command time / wall time |
+| --- | ---: | ---: | ---: |
+| Kepler | 25.91 M tickets/s | 43.20 M tickets/s | 49.7% → 75.1% |
+| TESS | 102.34 M tickets/s | 162.93 M tickets/s | 59.8% → 82.2% |
+
+Rates are medians of completed tickets per second with the pair tables ready. The equal-slot paired geometric gain was **56.5%** (90% bootstrap interval **47.0% to 66.8%**). GPU command coverage uses Metal timestamps. Activity Monitor reports a separate process utilization metric. The larger output buffer costs 3 MiB per slot, and the production audit intervals scale with the batch size to preserve checks per nonce. Repeat with `metal_selected DATASET SNAPSHOT_DIR dispatch`. Live throughput depends on the model and job turnover.
+
+## Two additional Metal screen experiments
+
+The first variant gives each ChaCha8 quarter-round fixed scalar indices. The second compiles a pair-only screen that exits at the third live row. The ideas came from the scalar quarter-rounds in an independent Metal miner and compile-time sparse specialization in the reference CUDA miner. [Metal source](https://github.com/pramonoutomo/neb/blob/52af7b84d897659359f4426e49f0c0efcfbdbb17/node/crates/neb-metalminer/src/neb_common.metal) · [CUDA source](https://github.com/SilasEigen/neb/blob/v1.0.9/pow/gpu/shares_tc.cu)
+
+Each of 32 order-balanced blocks per model screened the same 4,194,304 nonces in all four configurations. Across both models the scalar variant changed throughput by −0.01%, the pair-only variant by +0.22%, and the combination by −0.05%. The best candidate, pair-only, ran again on fresh Kepler and TESS snapshots and headers. Each timed pair returned identical evaluated counts and hit sets. Separate CPU checks exercised exact-target and just-below-target comparisons.
+
+| Pair-only holdout | Throughput gain | 90% paired bootstrap interval |
+| --- | ---: | ---: |
+| Kepler | +1.80% | +1.19% to +2.44% |
+| TESS | +0.39% | −0.35% to +1.16% |
+| Both, equally weighted | +1.09% | +0.57% to +1.61% |
+
+Both variants remain available for benchmarking. The lower confidence bound fell below the +1.5% production threshold on both models. Reproduce the four-way comparison with `metal_selected DATASET SNAPSHOT_DIR variants` and the pair-only holdout with `metal_selected DATASET FRESH_SNAPSHOT_DIR variants 2`.
+
+## Ahead-of-job TESS preparation
+
+[Suprminer v1.9.62](https://github.com/ocminer/suprminer/releases/tag/v1.9.62) prepares announced TESS models during Kepler on selected Linux RTX 50 cards. The Metal adapter supports this scheduling idea with `--selective --tess-ahead`. Its input is a standard `mining.set_model` for TESS received while a Kepler job remains active. The adapter waits 100 ms to let an ordinary immediate job notification take precedence. A separate scanner validates the weights, builds the CPU table with up to two threads, and prepares the GPU pair table in slices. Each slot retains its own active scanner. The authoritative TESS job adopts the prepared scanner only on an exact weight match. An incorrect hint, missing hint or unfinished preparation leaves the normal job path available.
+
+In ten paired M1 Max transition replays, a simulated two-second announcement led a five-second TESS job. Trained weights alternated between two captured TESS models. Relative to on-demand setup, Kepler completed 15.5% fewer tickets during the lead, TESS completed 24.9% more during the first five seconds, and combined work increased **19.8%** (90% paired bootstrap interval **18.3–21.3%**). Median on-job setup fell from **205.8 ms to 1.1 ms**. The replay CPU-checks hits, exercises a stale hint, and rejects a hint with an incorrect hash. In an earlier live log the median lead of 15 ordinary TESS notifications was zero and the maximum was 95 ms. The replay result applies when an actual advance announcement is available. Any additional pool-specific prediction protocol remains unverified.
+
+Run `metal_starts DATASET ADJACENT_MODELS_DIRECTORY` (Cargo example, feature `metal`) with no live miner sharing the GPU. The launcher enables ahead preparation for new sessions. The underlying adapter flag is optional.
 
 ## What other miners disclose
 

@@ -77,6 +77,9 @@ pub const BATCH: u32 = 1 << 16;
 pub trait Scanner: Send {
     /// Most nonces one scan can cover.
     fn capacity(&self) -> u32;
+    fn mining_mode(&self) -> Option<&'static str> {
+        None
+    }
     fn mining_capacity(&self) -> u32 {
         self.capacity().min(BATCH)
     }
@@ -295,6 +298,7 @@ pub fn spawn_worker_with_fallback(
         let mut lanes: Vec<(Lane, Option<Arc<Model>>)> = lanes.into_iter().map(|l| (l, None)).collect();
         let mut batches = 0u64;
         let mut requested_roll = None;
+        let mut previous_mode = None;
         // Replaces the scanner by the fallback and uploads `model` to it; false when that is impossible.
         let switch =
             |scanner: &mut Box<dyn Scanner>, fallback: &mut Option<Fallback>, model: &Model, why: &str| -> bool {
@@ -406,6 +410,13 @@ pub fn spawn_worker_with_fallback(
                 }
                 break (confirmed, evaluated);
             };
+            let mode = scanner.mining_mode().map(|m| (unit.slot, m));
+            if previous_mode != mode {
+                if let Some((slot, name)) = mode {
+                    eprintln!("active scanner slot {slot} {name}");
+                }
+                previous_mode = mode;
+            }
             session.stats().attempts.fetch_add(evaluated as u64, Ordering::Relaxed);
             if let Some(slot_stats) = session.stats().gpu_slots.get(unit.slot as usize) {
                 slot_stats.evaluated.fetch_add(evaluated as u64, Ordering::Relaxed);

@@ -14,19 +14,124 @@ mod replay {
     use neb_engines::table::Table;
     use neb_gpuminer::{
         Scanner,
-        metal_scanner::{MetalScanner, SCREEN_CAP},
+        metal_scanner::{MINING_SCREEN_CAP, MetalScanner, SCREEN_CAP},
     };
     use neb_pow::shares::{Arch, Model, ShareBuffers, load_datasets, share_indices};
     use std::{fs, path::Path, time::Instant};
 
+    fn screen_variants(
+        s: &mut MetalScanner,
+        model: &Model,
+        ds: &dyn neb_pow::shares::Dataset,
+        slot: usize,
+        hold: Option<u8>,
+    ) -> Result<(), String> {
+        let masks = hold.map_or_else(|| vec![0, 1, 2, 3], |id| vec![0, id]);
+        let pipes: Vec<_> = masks.iter().map(|&m| s.compile_pair_screen(m)).collect::<Result<_, _>>()?;
+        let header = [0xb4; 80];
+        let mut easy = [0xff; 32];
+        easy[31] = 63;
+        let mut reference = ShareBuffers::new();
+        let mut baseline = None;
+        for p in &pipes {
+            s.use_pair_screen(p)?;
+            let mut r = s.screen_range(&header, u32::MAX - 4095, 4096, &easy, 2, false)?;
+            r.hits.sort_unstable();
+            for &nonce in &r.hits {
+                let mut h = header;
+                h[76..].copy_from_slice(&nonce.to_le_bytes());
+                let ticket = reference.ticket(model, ds, blake3::hash(&h).as_bytes());
+                if !Target(easy).admits(&ticket) {
+                    return Err("CPU rejected screen hit".into());
+                }
+                // A bound equal to the oracle ticket must hit; one less must miss.
+                if s.screen_range(&h, nonce, 1, &ticket, 2, false)?.hits != [nonce] {
+                    return Err("exact-ticket probe missed".into());
+                }
+                let mut below = ticket;
+                for b in &mut below {
+                    let (v, borrow) = b.overflowing_sub(1);
+                    *b = v;
+                    if !borrow {
+                        break;
+                    }
+                }
+                if ticket != [0; 32] && !s.screen_range(&h, nonce, 1, &below, 2, false)?.hits.is_empty() {
+                    return Err("below-ticket probe hit".into());
+                }
+            }
+            let result = (r.evaluated, r.hits);
+            if baseline.as_ref().is_some_and(|b| *b != result) {
+                return Err("screen validation differs".into());
+            }
+            baseline = Some(result);
+        }
+        let count = 4 * MINING_SCREEN_CAP;
+        let mut bound = [0xff; 32];
+        bound[29..].fill(0);
+        for block in 0..=32u32 {
+            let mut h = [if hold.is_some() { 171 } else { 39 }; 80];
+            h[..4].copy_from_slice(&block.to_le_bytes());
+            h[4] = slot as u8;
+            let mut order: Vec<_> = (0..masks.len()).collect();
+            let n = order.len();
+            order.rotate_left((block as usize + slot) % n);
+            if (block as usize / n) % 2 == 1 {
+                order.reverse();
+            }
+            let mut expected = None;
+            for i in order {
+                s.use_pair_screen(&pipes[i])?;
+                let mut evaluated = 0;
+                let mut hits = vec![];
+                let mut gpu = 0.;
+                let t = Instant::now();
+                for off in (0..count).step_by(MINING_SCREEN_CAP as usize) {
+                    let r = s.screen_range(&h, block * count + off, MINING_SCREEN_CAP, &bound, 2, false)?;
+                    evaluated += r.evaluated;
+                    hits.extend(r.hits);
+                    gpu += r.gpu_s;
+                }
+                let wall = t.elapsed().as_secs_f64();
+                hits.sort_unstable();
+                let result = (evaluated, hits);
+                if expected.as_ref().is_some_and(|prev| prev != &result) {
+                    return Err("timed hit set or count differs".into());
+                }
+                expected = Some(result);
+                if block > 0 {
+                    println!("{block},{slot},{},{count},{evaluated},{:.6},{:.6}", masks[i], wall * 1000., gpu * 1000.);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<(), String> {
         let args: Vec<_> = std::env::args().skip(1).collect();
-        if args.len() != 2 {
-            return Err("DATASET SNAPSHOT_DIR".into());
+        let dispatch = args.len() == 3 && args[2] == "dispatch";
+        let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
+        let hold = if variants && args.len() == 4 {
+            let id = args[3].parse::<u8>().map_err(|_| "bad mask")?;
+            if !(1..=3).contains(&id) {
+                return Err("holdout mask must be 1, 2 or 3".into());
+            }
+            Some(id)
+        } else {
+            None
+        };
+        if args.len() != 2 && !dispatch && !variants {
+            return Err("DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK]]".into());
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
         let sets = load_datasets(Path::new(&args[0]), Some(pin.as_bytes()))?;
-        println!("block,slot,arity,screened,evaluated,wall_ms");
+        if variants {
+            println!("block,slot,mask,screened,evaluated,wall_ms,gpu_ms");
+        } else if dispatch {
+            println!("block,slot,batch,screened,evaluated,wall_ms,gpu_ms");
+        } else {
+            println!("block,slot,arity,screened,evaluated,wall_ms");
+        }
         for (slot, ds) in sets.into_iter().enumerate() {
             let dir = Path::new(&args[1]);
             let packed = fs::read(dir.join(format!("slot-{slot}.bin"))).map_err(|e| e.to_string())?;
@@ -37,7 +142,62 @@ mod replay {
             }
             let mut s = MetalScanner::open(ds.clone())?;
             s.set_weights(&model)?;
-            s.build_combos(128)?;
+            s.build_combos(if dispatch || variants { 0 } else { 128 })?;
+            if variants {
+                screen_variants(&mut s, &model, &*ds, slot, hold)?;
+                continue;
+            }
+            if dispatch {
+                let total = 4_194_304;
+                for block in 0..=32u32 {
+                    let mut h = [slot as u8 + 37; 80];
+                    h[0..4].copy_from_slice(&block.to_le_bytes());
+                    let start = if block == 32 { u32::MAX - (total - 1) } else { block * total };
+                    let mut bound = [0xff; 32];
+                    bound[30..].fill(0);
+                    let mut order = [SCREEN_CAP, MINING_SCREEN_CAP];
+                    if (block + slot as u32).is_multiple_of(2) {
+                        order.reverse();
+                    }
+                    let mut expected = None;
+                    for batch in order {
+                        let mut evaluated = 0;
+                        let mut hits = vec![];
+                        let mut gpu_s = 0.;
+                        let t = Instant::now();
+                        for offset in (0..total).step_by(batch as usize) {
+                            let r = s.screen_range(&h, start + offset, batch, &bound, 2, false)?;
+                            evaluated += r.evaluated;
+                            gpu_s += r.gpu_s;
+                            hits.extend(r.hits);
+                        }
+                        let wall = t.elapsed().as_secs_f64();
+                        hits.sort_unstable();
+                        if let Some((count, want)) = &expected {
+                            if *count != evaluated || *want != hits {
+                                return Err("dispatch changed evaluated count or hit set".into());
+                            }
+                        } else {
+                            let mut scratch = ShareBuffers::new();
+                            for &nonce in &hits {
+                                h[76..].copy_from_slice(&nonce.to_le_bytes());
+                                if !Target(bound).admits(&scratch.ticket(&model, &*ds, blake3::hash(&h).as_bytes())) {
+                                    return Err("reference rejected dispatch hit".into());
+                                }
+                            }
+                            expected = Some((evaluated, hits));
+                        }
+                        if block > 0 {
+                            println!(
+                                "{block},{slot},{batch},{total},{evaluated},{:.6},{:.6}",
+                                wall * 1000.,
+                                gpu_s * 1000.
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             let pipe = s.compile_variant(28 | 64 | 128)?;
             s.use_variant(&pipe);
             s.set_host_mask(8 | 32);

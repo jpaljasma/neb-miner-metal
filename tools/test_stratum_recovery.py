@@ -22,6 +22,16 @@ class Sink:
     def close(self):
         pass
 
+    @property
+    def transport(self):
+        return self
+
+    def get_write_buffer_size(self):
+        return 0
+
+    def is_closing(self):
+        return False
+
 
 class Events:
     duration = 1800
@@ -45,12 +55,13 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.pool, self.worker = asyncio.StreamReader(), asyncio.StreamReader()
         self.to_pool, self.to_worker = Sink(), Sink()
         self.events = Events()
+        self.hints = Sink()
         self.worker.feed_data(bridge.frame(1, struct.pack("<HB", 1, 15) + b"neb-miner-metal"))
         # This login never leaves the in-memory transport.
         address_file = bridge.ROOT / ".neb-payout-address"
         self.login = (address_file.read_text().strip() if address_file.exists() else "OFFLINE") + ".neb-miner-metal"
         self.task = asyncio.create_task(bridge.session((self.pool, self.to_pool),
-            (self.worker, self.to_worker), self.login, self.events))
+            (self.worker, self.to_worker), self.login, self.events, self.hints))
         await self.recv_pool()
 
     async def asyncTearDown(self):
@@ -91,6 +102,23 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         unknown = [d for e,d in self.events.events if e == "unconfirmed"]
         self.assertEqual([d["request"] for d in unknown], [req["id"]])
         self.assertFalse(self.events.slots)
+
+    async def test_early_tess_model_is_advisory_until_matching_job(self):
+        await self.job()
+        key = "cd"*32
+        self.send(method="mining.set_model", params=[key, 1, "A"*17334+"=="])
+        hint = await asyncio.wait_for(self.hints.sent.get(), 1)
+        self.assertEqual(hint, bytes.fromhex(key) + bytes(13000))
+        self.assertTrue(self.to_worker.sent.empty())
+        # A later announcement must not displace a job's still-cached weights.
+        self.send(method="mining.set_model", params=["ef"*32, 1, "A"*17334+"=="])
+        self.send(method="mining.notify", params=["next", "01"*32, "", "", [], "00000001",
+                  "dd800000", "00000001", True, 13, key, 1, "00000001", "02"*32, "00000060"])
+        model = await asyncio.wait_for(self.to_worker.sent.get(), 1)
+        self.assertEqual(model[4:38], bytes([7, 1]) + bytes.fromhex(key))
+        await asyncio.wait_for(self.to_worker.sent.get(), 1)
+        await asyncio.sleep(.12)
+        self.assertTrue(self.hints.sent.empty())
 
     async def test_silent_pool_releases_unacknowledged_share(self):
         with patch.object(bridge,"ACK_TIMEOUT_S",0.02):

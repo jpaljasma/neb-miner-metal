@@ -11,11 +11,15 @@ use neb_pow::shares::{Arch, Model, SharedDataset, share_indices};
 use objc::{msg_send, rc::autoreleasepool, sel, sel_impl};
 
 use crate::Scanner;
+#[path = "metal_ahead.rs"]
+mod metal_ahead;
 #[path = "metal_indices.rs"]
 mod metal_indices;
+pub use metal_ahead::TessAhead;
 #[path = "metal_screen.rs"]
 mod metal_screen;
-pub use metal_screen::{PROBE_CAP, SCREEN_CAP, ScreenResult};
+pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, ScreenResult};
+const SCREEN_BATCH_SCALE: u64 = (MINING_SCREEN_CAP / SCREEN_CAP) as u64;
 
 const BATCH: usize = 16384;
 const DISPATCH: usize = 2048;
@@ -93,6 +97,15 @@ struct Combos {
     last_slice: std::time::Instant,
     slice_delay: std::time::Duration,
     reuse: Option<PairReuse>,
+}
+
+// Reassess a marginal model after it has accumulated real mining time.
+// An inactive slot cannot spend the other slot's exploratory build budget.
+struct RetryScreen {
+    evaluated: u64,
+    active_s: f64,
+    build_s: f64,
+    next_probe: u32,
 }
 
 struct PairReuse {
@@ -201,9 +214,12 @@ pub struct MetalScanner {
     dispatch_size: usize,
     host_mask: u8,
     allow_screen: bool,
+    ahead: Option<TessAhead>,
+    build_threads: Option<usize>,
     allow_reuse: bool,
     reuse_hint: Option<PairReuse>,
     use_screen: bool,
+    retry_screen: Option<RetryScreen>,
     screen_batches: u64,
     #[cfg(feature = "metal-bench")]
     gpu_seconds: f64,
@@ -234,9 +250,12 @@ impl MetalScanner {
             dispatch_size: DISPATCH,
             host_mask: 0,
             allow_screen: false,
+            ahead: None,
+            build_threads: None,
             allow_reuse: true,
             reuse_hint: None,
             use_screen: false,
+            retry_screen: None,
             screen_batches: 0,
             dataset,
             rows: None,
@@ -376,6 +395,11 @@ impl MetalScanner {
     pub fn enable_screen(&mut self) {
         self.allow_screen = true;
     }
+    pub fn enable_tess_ahead(&mut self) -> TessAhead {
+        let ahead = TessAhead::new(self.dataset.clone());
+        self.ahead = Some(ahead.clone());
+        ahead
+    }
 
     fn audit_screen(&mut self, model: &Model, header: &[u8; 80], start: u32, count: u32) -> Result<(), String> {
         let mut bound = [0xff; 32];
@@ -438,11 +462,11 @@ impl MetalScanner {
         let t = std::time::Instant::now();
         self.tickets(&header, 0, 8192)?;
         let full = 8192. / t.elapsed().as_secs_f64();
-        let mut rates = Vec::new();
-        for i in 1..=3 {
+        let mut rates = [0.; 3];
+        for (i, rate) in rates.iter_mut().enumerate() {
             let t = std::time::Instant::now();
-            self.screen_range(&header, i * SCREEN_CAP, SCREEN_CAP, &[0; 32], 2, false)?;
-            rates.push(f64::from(SCREEN_CAP) / t.elapsed().as_secs_f64());
+            self.screen_range(&header, (i as u32 + 1) * MINING_SCREEN_CAP, MINING_SCREEN_CAP, &[0; 32], 2, false)?;
+            *rate = f64::from(MINING_SCREEN_CAP) / t.elapsed().as_secs_f64();
         }
         rates.sort_by(f64::total_cmp);
         let rows = self.rows.as_ref().unwrap();
@@ -456,12 +480,71 @@ impl MetalScanner {
         // Compare payoff over a 30-second job, charging the entire predicted build.
         // The live builder interleaves individual slices with ticket evaluation.
         let keep = expected * (30. - build_s).max(0.) > full * 30. * 1.05;
+        if !keep && expected > 1.25 * full {
+            self.retry_screen = Some(RetryScreen { evaluated: 0, active_s: 0., build_s: 0., next_probe: c.args[0] });
+        }
         eprintln!(
             "model trial full {:.0} attempts/s, predicted pair {:.0} attempts/s, build {:.2}s, selected {}",
             full, expected, build_s, keep
         );
         self.screen_batches = 0;
         Ok(keep)
+    }
+
+    fn retry_after_full_batch(
+        &mut self,
+        model: &Model,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        seconds: f64,
+    ) -> Result<(), String> {
+        let Some(mut retry) = self.retry_screen.take() else {
+            return Ok(());
+        };
+        retry.active_s += seconds;
+        retry.evaluated += u64::from(count);
+        // After the grace period, allow one build second per eight seconds
+        // of full scanning. The budget can overshoot by at most one slice.
+        if retry.active_s < 15. || retry.build_s * 8. > retry.active_s - 15. {
+            self.retry_screen = Some(retry);
+            return Ok(());
+        }
+        let r = self.rows.as_mut().unwrap();
+        let c = r.combos.as_mut().unwrap();
+        let t = std::time::Instant::now();
+        c.advance(&self.queue, &r.buffer)?;
+        retry.build_s += t.elapsed().as_secs_f64();
+        let [ready, _, total] = c.args;
+        if ready >= retry.next_probe || ready == total {
+            let mut rates = [0.; 3];
+            for (i, rate) in rates.iter_mut().enumerate() {
+                let nonce = start.wrapping_add((i as u32) * MINING_SCREEN_CAP).min(u32::MAX - MINING_SCREEN_CAP + 1);
+                let t = std::time::Instant::now();
+                let probe = self.screen_range(header, nonce, MINING_SCREEN_CAP, &[0; 32], 2, false)?;
+                *rate = f64::from(probe.evaluated) / t.elapsed().as_secs_f64();
+            }
+            rates.sort_by(f64::total_cmp);
+            // While building, the scanner can spend up to a third of its
+            // time on slices. Charge that cost before switching.
+            let full_rate = retry.evaluated as f64 / retry.active_s;
+            let required = full_rate * if ready == total { 1.05 } else { 1.60 };
+            if rates[1] > required {
+                self.audit_screen(model, header, start.min(u32::MAX - 15), 16)?;
+                self.use_screen = true;
+                eprintln!(
+                    "long-job retry selected GPU screen at {ready}/{total} pairs: measured {:.0} attempts/s (full {:.0})",
+                    rates[1], full_rate
+                );
+                return Ok(());
+            }
+            if ready == total {
+                return Ok(());
+            }
+            retry.next_probe = ready.saturating_add((total / 16).max(32768));
+        }
+        self.retry_screen = Some(retry);
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     pub fn screen_range(
@@ -588,6 +671,16 @@ impl MetalScanner {
     pub fn set_host_mask(&mut self, flags: u8) {
         self.host_mask = flags;
     }
+    pub fn compile_pair_screen(&self, mask: u8) -> Result<ComputePipelineState, String> {
+        metal_screen::Screen::variant(&self.device, 0, mask)
+    }
+    pub fn use_pair_screen(&mut self, p: &ComputePipelineState) -> Result<(), String> {
+        if self.screen.is_none() {
+            self.screen = Some(metal_screen::Screen::new(&self.device)?);
+        }
+        self.screen.as_mut().unwrap().set_pair_pipeline(p.clone());
+        Ok(())
+    }
     pub fn compile_variant(&self, mask: u8) -> Result<(ComputePipelineState, u64), String> {
         pipeline(&self.device, mask)
     }
@@ -618,8 +711,11 @@ impl MetalScanner {
 }
 
 impl Scanner for MetalScanner {
+    fn mining_mode(&self) -> Option<&'static str> {
+        Some(if self.use_screen { "selective" } else { "exhaustive" })
+    }
     fn mining_capacity(&self) -> u32 {
-        if self.use_screen { SCREEN_CAP } else { self.capacity() }
+        if self.use_screen { MINING_SCREEN_CAP } else { self.capacity() }
     }
     fn request_roll(&self) -> bool {
         self.allow_screen
@@ -633,12 +729,18 @@ impl Scanner for MetalScanner {
         bound: &[u8; 32],
     ) -> Result<(Vec<u32>, u32), String> {
         if !self.use_screen {
-            return Ok((self.scan(header, start, count, bound)?, count));
+            if self.retry_screen.is_none() {
+                return Ok((self.scan(header, start, count, bound)?, count));
+            }
+            let t = std::time::Instant::now();
+            let hits = self.scan(header, start, count, bound)?;
+            self.retry_after_full_batch(model, header, start, count, t.elapsed().as_secs_f64())?;
+            return Ok((hits, count));
         }
         let rows = self.rows.as_mut().unwrap();
         rows.combos.as_mut().unwrap().advance(&self.queue, &rows.buffer)?;
         self.screen_batches += 1;
-        if self.screen_batches.is_multiple_of(512) {
+        if self.screen_batches.is_multiple_of(512 / SCREEN_BATCH_SCALE) {
             self.audit_screen(model, header, start, count.min(16))?;
         }
         let result = self.screen_range(header, start, count, bound, 2, false)?;
@@ -649,7 +751,7 @@ impl Scanner for MetalScanner {
     }
     fn audit_batches(&self) -> u64 {
         if self.use_screen {
-            crate::AUDIT_BATCHES
+            crate::AUDIT_BATCHES / SCREEN_BATCH_SCALE
         } else {
             (crate::AUDIT_BATCHES * 4096 / u64::from(self.capacity())).max(1)
         }
@@ -660,10 +762,17 @@ impl Scanner for MetalScanner {
     fn set_weights(&mut self, model: &Model) -> Result<(), String> {
         // Each scanner owns one immutable dataset. A refreshed job can resend
         // identical weights in a new Model; residuals do not affect its tickets.
+        let prepared = self.ahead.as_ref().and_then(|ahead| ahead.take(model));
         if self.rows.as_ref().is_some_and(|rows| rows.weights == model.weights()) {
             return Ok(());
         }
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if let Some(mut prepared) = prepared {
+            prepared.ahead = self.ahead.take();
+            *self = *prepared;
+            eprintln!("using verified TESS table prepared ahead");
+            return Ok(());
+        }
+        let threads = self.build_threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         let table = Table::build(model, &*self.dataset, threads, vec![])?;
         #[cfg(not(feature = "metal-bench"))]
         {
@@ -742,6 +851,7 @@ impl Scanner for MetalScanner {
         rows.live = live;
         rows.combos = None;
         self.use_screen = false;
+        self.retry_screen = None;
         if try_screen {
             match self.prepare_combos(0, true).and_then(|()| self.choose_screen(model)) {
                 Ok(keep) => self.use_screen = keep,
