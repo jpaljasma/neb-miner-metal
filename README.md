@@ -19,7 +19,7 @@ The two miners make different tradeoffs. This backend spent 306 ms on Kepler and
 
 In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s** and TESS averaged **93.30 MH/s**. Each rate counts completed tickets over the time the pool assigned that model, including setup. Suprnova accepted 59 of 59 Kepler shares and 19 of 20 TESS shares. One TESS share went stale at a job change. [Pool tests and tuning](docs/metal-pool-tuning.md)
 
-![NEB terminal dashboard with Kepler mining, the last TESS job, and recent pool replies](docs/images/metal-miner-dashboard.png)
+![NEB dashboard mining over TCP, with Kepler active, the last TESS job and recent pool replies](docs/images/metal-miner-dashboard.png)
 
 ## Try it on your Mac
 
