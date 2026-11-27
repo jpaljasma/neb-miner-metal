@@ -23,6 +23,7 @@ pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, ScreenResult};
 pub struct PairScreenVariant {
     pipeline: ComputePipelineState,
     mode: u8,
+    tuning: metal_screen::PairTuning,
 }
 const SCREEN_BATCH_SCALE: u64 = (MINING_SCREEN_CAP / SCREEN_CAP) as u64;
 
@@ -69,10 +70,10 @@ fn table_pipeline(device: &Device, mask: u8, build: u8, read: u8) -> Result<(Com
 // The Objective-C allocation API can return nil. metal-rs 0.33 models its
 // return as a non-null Buffer, so check the raw return before taking ownership.
 #[allow(unexpected_cfgs)] // objc 0.2's selector macro tests the legacy cargo-clippy cfg
-fn shared_buffer(device: &Device, len: usize) -> Result<Buffer, String> {
+fn shared_buffer(device: &metal::DeviceRef, len: usize) -> Result<Buffer, String> {
     // SAFETY: MTLDevice takes two NSUInteger arguments and returns a retained
     // MTLBuffer or nil. The Objective-C "new" ownership transfers to Buffer.
-    let raw: *mut metal::MTLBuffer = unsafe { msg_send![&**device, newBufferWithLength:len options:SHARED.bits()] };
+    let raw: *mut metal::MTLBuffer = unsafe { msg_send![device, newBufferWithLength:len options:SHARED.bits()] };
     if raw.is_null() {
         return Err(format!("Metal could not allocate {len} shared bytes"));
     }
@@ -103,7 +104,7 @@ struct ModelRows {
 }
 
 struct Combos {
-    ranks: Buffer,
+    rank_buffers: [Option<Buffer>; 3],
     values: Buffer,
     args: [u32; 3], // ready pairs, ready triple prefix, allocated pairs
     ids: Buffer,
@@ -383,7 +384,7 @@ impl MetalScanner {
                 #[cfg(feature = "metal-bench")]
                 if self.host_mask & 64 != 0 {
                     let c = rows.combos.as_ref().expect("combination replay prepared");
-                    enc.set_buffer(4, Some(&c.ranks), 0);
+                    enc.set_buffer(4, c.rank_buffers[metal_screen::RankLayout::Plain as usize].as_deref(), 0);
                     enc.set_buffer(5, Some(&c.values), 0);
                     enc.set_bytes(6, 12, c.args.as_ptr().cast());
                 }
@@ -592,11 +593,11 @@ impl MetalScanner {
         check: bool,
     ) -> Result<ScreenResult, String> {
         if self.screen.is_none() {
-            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets)?);
+            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets, self.dataset.n())?);
         }
         self.screen.as_mut().unwrap().scan(
             &self.queue,
-            self.rows.as_ref().ok_or("missing model")?,
+            self.rows.as_mut().ok_or("missing model")?,
             self.dataset.n(),
             header,
             start,
@@ -616,15 +617,7 @@ impl MetalScanner {
     }
     fn prepare_combos(&mut self, triple_mib: usize, progressive: bool) -> Result<(), String> {
         let rows = self.rows.as_mut().ok_or("missing model rows")?;
-        let mut rank = vec![u32::MAX; rows.live.len()];
-        let mut ids = Vec::new();
-        for (i, &live) in rows.live.iter().enumerate() {
-            if live {
-                rank[i] = ids.len() as u32;
-                ids.push(i as u32);
-            }
-        }
-        let n = ids.len();
+        let n = rows.live.iter().filter(|&&live| live).count();
         let mut pairs = n * (n + 1) / 2;
         if progressive {
             pairs = pairs.min((1024 * 1024 * 1024) / 32);
@@ -636,25 +629,29 @@ impl MetalScanner {
         if (!progressive && n == 0) || bytes > 4usize << 30 || bytes as u64 > self.device.max_buffer_length() {
             return Err("combination table exceeds the replay budget or is empty".into());
         }
-        let copy = |values: &[u32]| -> Result<Buffer, String> {
-            let buf = shared_buffer(&self.device, std::mem::size_of_val(values))?;
-            // SAFETY: buf is new shared storage with exactly values.len() words.
-            unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr(), buf.contents().cast(), values.len());
-            }
-            Ok(buf)
-        };
-        let ranks = copy(&rank)?;
-        if ids.is_empty() {
-            ids.push(0);
+        let live_ids = shared_buffer(&self.device, n.max(1) * size_of::<u32>())?;
+        // SAFETY: this unpublished mapping has space for every live row, including the empty case.
+        let ids = unsafe { std::slice::from_raw_parts_mut(live_ids.contents().cast::<u32>(), n) };
+        let mut rank = vec![u32::MAX; rows.live.len()];
+        let live_samples = rows.live.iter().enumerate().filter_map(|(sample, &live)| live.then_some(sample));
+        for (r, sample) in live_samples.enumerate() {
+            ids[r] = sample as u32;
+            rank[sample] = r as u32;
         }
-        let live_ids = copy(&ids)?;
+        let layout = metal_screen::PairTuning::production(self.compact_tickets, self.dataset.n()).ranks;
+        let mut rank_buffers = [None, None, None];
+        rank_buffers[layout as usize] = Some(layout.build(&self.device, &rank)?);
+        // The exhaustive combo-read benchmark uses the upstream 32-bit sentinel representation.
+        #[cfg(feature = "metal-bench")]
+        {
+            rank_buffers[0] = Some(metal_screen::RankLayout::Plain.build(&self.device, &rank)?);
+        }
         let values = shared_buffer(&self.device, bytes.max(32))?;
         let reuse = self.reuse_hint.take();
         let build_kind = if reuse.is_some() { 4 } else { 2 };
         let (pair_builder, _) = table_pipeline(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0)?;
         rows.combos = Some(Combos {
-            ranks,
+            rank_buffers,
             values,
             ids: live_ids,
             pair_builder,
@@ -710,16 +707,29 @@ impl MetalScanner {
         metal_screen::Screen::variant(&self.device, false, mask & 3)
     }
     pub fn use_pair_screen(&mut self, p: &ComputePipelineState) -> Result<(), String> {
-        self.use_screen_variant(&PairScreenVariant { pipeline: p.clone(), mode: 0 })
+        self.use_screen_variant(&PairScreenVariant { pipeline: p.clone(), mode: 0, tuning: Default::default() })
     }
     pub fn compile_screen_variant(&self, mode: u8) -> Result<PairScreenVariant, String> {
-        Ok(PairScreenVariant { pipeline: metal_screen::Screen::variant(&self.device, false, mode)?, mode })
+        Ok(PairScreenVariant {
+            pipeline: metal_screen::Screen::variant(&self.device, false, mode)?,
+            mode,
+            tuning: Default::default(),
+        })
+    }
+    pub fn compile_rank_tuning(&self, id: u8) -> Result<PairScreenVariant, String> {
+        use metal_screen::{PairTuning, RankLayout, Screen};
+        let threads = *[128, 64, 256].get((id / 3) as usize).ok_or("invalid tuning id")?;
+        let ranks = [RankLayout::Plain, RankLayout::Tagged32, RankLayout::Tagged16][(id % 3) as usize];
+        let tuning = PairTuning { ranks, threads };
+        let mode = metal_screen::pair_mode(self.compact_tickets);
+        let pipeline = Screen::tuned_variant(&self.device, false, mode, tuning)?;
+        Ok(PairScreenVariant { pipeline, mode, tuning })
     }
     pub fn use_screen_variant(&mut self, variant: &PairScreenVariant) -> Result<(), String> {
         if self.screen.is_none() {
-            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets)?);
+            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets, self.dataset.n())?);
         }
-        self.screen.as_mut().unwrap().set_pair_pipeline(variant.pipeline.clone(), variant.mode);
+        self.screen.as_mut().unwrap().set_pair_pipeline(variant.pipeline.clone(), variant.mode, variant.tuning);
         Ok(())
     }
     pub fn compile_variant(&self, mask: u8) -> Result<(ComputePipelineState, u64), String> {

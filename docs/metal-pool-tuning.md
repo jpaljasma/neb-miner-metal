@@ -129,6 +129,27 @@ Model weights strongly affect absolute rates. The selected Kepler kernel process
 
 On those two Kepler snapshots the GPU screened 1.07 and 1.30 billion raw nonces/s. At those scan rates, reaching 100 million completed tickets/s would require evaluating 9.4% and 7.7% of the nonces, respectively, before accounting for job setup.
 
+### Tagged ranks and GPU submission size
+
+Three tuning questions guided the next M1 Max replay.
+
+1. **How much eligibility work can move out of the nonce loop?** The CPU marks each live row once per model. An idle lookup returns zero. A live lookup returns a count bit plus the row's rank. Summing four lookups at a time detects a third live row with one threshold comparison. For an eligible pair, subtracting the larger rank from the sum recovers the smaller, including when both ranks are equal. [Apple's guidance on removing invariant work](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/CodeSpeed/Articles/CriticalCode.html)
+2. **Can the lookup use fewer bytes?** We compared 16-bit and 32-bit tagged entries. Kepler was consistently faster with 32 bits. TESS uses 16 bits and widens before summing. Its GPU rank map now takes 14,178 bytes for 7,089 rows. Production writes the tags and the live-row ID list directly into their final shared Metal buffers. The CPU keeps its own rank data for verification. [Metal Compute on MacBook Pro](https://developer.apple.com/videos/play/tech-talks/10580/) · [Apple silicon shader tuning](https://developer.apple.com/videos/play/wwdc2020/10632/)
+3. **Which dispatch dimensions keep the GPU supplied with work?** Groups of 64, 128 and 256 threads all use whole 32-lane SIMD groups. With tagged ranks, changing the width from 128 gave no consistent gain across three model snapshots. Increasing the work per command from 1,048,576 to 4,194,304 nonces did. The output buffer grows by 12 MiB per scanner. The audit interval scales with batch size to preserve the number of checks per raw nonce. [Calculating threadgroup and grid sizes](https://developer.apple.com/documentation/metal/calculating-threadgroup-and-grid-sizes) · [Metal command buffer guidance](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/CommandBuffers.html)
+
+The rank and width screen crossed three layouts with three widths on identical jobs. It used 32 paired blocks per model, then 64 on a different pair of snapshots. A third snapshot pair checked the width choice. At 128 threads with the previous batch size, the selected layout gained **2.18% on Kepler** (90% interval +0.86% to +3.56%) and **11.72% on TESS** (+10.18% to +13.29%) on the holdout. On the third snapshot the gains were +2.81% and +11.81%.
+
+The final comparison directly paired the old and new configurations over 96 blocks per model. Each configuration screened the same 8,388,608 nonces per block, including the final interval ending at `u32::MAX`. Both returned identical evaluated counts and hit lists.
+
+| Model | Previous → selected median completed MH/s | Paired throughput gain (90% interval) | GPU command time / wall time | P95 of each block's slowest dispatch |
+| --- | ---: | ---: | ---: | ---: |
+| Kepler | 10.01 → 13.56 | **+35.71%** (+34.95% to +36.53%) | 68.3% → 86.9% | 1.21 → 2.79 ms |
+| TESS | 339.58 → 485.29 | **+46.58%** (+43.32% to +50.73%) | 72.0% → 89.5% | 1.66 → 3.24 ms |
+
+GPU command time comes from Metal timestamps. Activity Monitor measures the whole device. These replay rates use prepared tables. In particular, the Kepler holdout had relatively few eligible nonces.
+
+Run `metal_selected DATASET SNAPSHOT_DIR rank-tune`, then `rank-confirm` with a different snapshot directory. Layout IDs 0, 1 and 2 select plain, tagged 32-bit and tagged 16-bit ranks at 128 threads. Add 3 for 64 threads or 6 for 256. The `feed` and `feed-confirm` modes compare one, two or four million nonces per submission. The latter also includes the previous production configuration as control 0. Save each CSV and run `python3 tools/analyze_metal_factorial.py FILE.csv` to calculate the paired gains.
+
 ## Ahead-of-job TESS preparation
 
 [Suprminer v1.9.62](https://github.com/ocminer/suprminer/releases/tag/v1.9.62) prepares announced TESS models during Kepler on selected Linux RTX 50 cards. The Metal adapter supports this scheduling idea with `--selective --tess-ahead`. Its input is a standard `mining.set_model` for TESS received while a Kepler job remains active. The adapter waits 100 ms to let an ordinary immediate job notification take precedence. A separate scanner validates the weights, builds the CPU table with up to two threads, and prepares the GPU pair table in slices. Each slot retains its own active scanner. The authoritative TESS job adopts the prepared scanner only on an exact weight match. An incorrect hint, missing hint or unfinished preparation leaves the normal job path available.
