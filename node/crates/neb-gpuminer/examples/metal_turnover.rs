@@ -179,6 +179,79 @@ mod apple {
         }
         Ok(())
     }
+    /// Return the completion timestamp before the host verifies the GPU's candidates.
+    fn window_batch(
+        scanner: &mut MetalScanner,
+        model: &Model,
+        dataset: &dyn Dataset,
+        header: &mut [u8; 80],
+        raw: &mut u64,
+        bound: &[u8; 32],
+        cpu: &mut ShareBuffers,
+    ) -> Result<(u32, Instant), String> {
+        let start = *raw as u32;
+        header[40..44].copy_from_slice(&((*raw >> 32) as u32).to_le_bytes());
+        let count = u64::from(scanner.mining_capacity()).min((1u64 << 32) - u64::from(start)) as u32;
+        let (hits, evaluated) = scanner.mine_range(model, header, start, count, bound)?;
+        let finished = Instant::now();
+        for nonce in hits {
+            header[76..].copy_from_slice(&nonce.to_le_bytes());
+            if !Target(*bound).admits(&cpu.ticket(model, dataset, blake3::hash(header).as_bytes())) {
+                return Err("CPU rejected candidate".into());
+            }
+        }
+        *raw += u64::from(count);
+        Ok((evaluated, finished))
+    }
+
+    pub fn cpu_feed(args: &[String], sets: &[SharedDataset]) -> Result<(), String> {
+        let [_, _, old, new, slot, threads, seed, oracle] = args else {
+            return Err("cpu-feed DATASET OLD NEW SLOT THREADS SEED ORACLE".into());
+        };
+        let slot: usize = slot.parse().map_err(|_| "invalid slot")?;
+        let ds = sets.get(slot).ok_or("invalid slot")?;
+        let threads: std::num::NonZeroUsize = threads.parse().map_err(|_| "expected a positive CPU thread count")?;
+        let available = std::thread::available_parallelism().map_err(|e| e.to_string())?;
+        if threads > available {
+            return Err(format!("requested {threads} CPU threads, only {available} available"));
+        }
+        let seed: u8 = seed.parse().map_err(|_| "invalid header seed")?;
+        let old = model(Path::new(old), slot)?;
+        let new = model(Path::new(new), slot)?;
+        if old.weights_hash() == new.weights_hash() {
+            return Err("expected model turnover".into());
+        }
+        let mut s = MetalScanner::for_slot(ds.clone(), slot)?;
+        s.set_setup_threads(threads);
+        s.set_weights(&old)?;
+        s.build_combos(0)?;
+        s.turnover_evaluate(&[19; 80], 0, MINING_SCREEN_CAP, &[0; 32])?;
+        s.enable_screen();
+
+        let clock = Instant::now();
+        let deadline = clock + std::time::Duration::from_secs(5);
+        s.set_weights(&new)?;
+        let setup = clock.elapsed().as_secs_f64();
+        if s.mining_mode() != Some("selective") {
+            return Err("cpu-feed requires a destination model that selects the pair scanner".into());
+        }
+        let mut cpu = ShareBuffers::new();
+        let mut header = [seed; 80];
+        let mut raw = 0;
+        let mut tickets = 0u64;
+        let mut bound = [0xff; 32];
+        bound[29..].fill(0);
+        while Instant::now() < deadline {
+            let (evaluated, finished) = window_batch(&mut s, &new, &**ds, &mut header, &mut raw, &bound, &mut cpu)?;
+            if finished <= deadline {
+                tickets += u64::from(evaluated);
+            }
+        }
+        verify(&mut s, Path::new(oracle), false)?;
+        println!("cpu-feed,{slot},{threads},{seed},{setup:.6},{tickets}");
+        Ok(())
+    }
+
     pub fn run(args: &[String], sets: &[SharedDataset]) -> Result<(), String> {
         // MODE DATASET OLD NEW SLOT MASK STYLE SEED ORACLE
         if args.len() != 9 {
@@ -325,17 +398,7 @@ mod apple {
                     break;
                 }
                 while clock.elapsed().as_secs_f64() < mark {
-                    let start = raw as u32;
-                    h[40..44].copy_from_slice(&((raw >> 32) as u32).to_le_bytes());
-                    let n = u64::from(s.mining_capacity()).min((1u64 << 32) - u64::from(start)) as u32;
-                    let (hits, evaluated) = s.mine_range(&new, &h, start, n, &bound)?;
-                    for nonce in hits {
-                        h[76..].copy_from_slice(&nonce.to_le_bytes());
-                        if !Target(bound).admits(&cpu.ticket(&new, &**ds, blake3::hash(&h).as_bytes())) {
-                            return Err("CPU rejected candidate".into());
-                        }
-                    }
-                    raw += u64::from(n);
+                    let (evaluated, _) = window_batch(&mut s, &new, &**ds, &mut h, &mut raw, &bound, &mut cpu)?;
                     total += u64::from(evaluated);
                 }
                 println!(
@@ -392,6 +455,8 @@ fn main() -> Result<(), String> {
     let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
     let sets = load_datasets(Path::new(&args[1]), Some(pin.as_bytes()))?;
     match args[0].as_str() {
+        #[cfg(target_os = "macos")]
+        "cpu-feed" => apple::cpu_feed(&args, &sets),
         "support" => {
             for dir in &args[2..] {
                 for (slot, ds) in sets.iter().enumerate() {

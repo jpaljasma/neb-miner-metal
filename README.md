@@ -21,6 +21,8 @@ In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s**
 
 When the model changes, a dedicated two-row Metal kernel builds the pair lookup table. On a held-out Kepler model it cut table construction from **5.07 s to 2.48 s**. [Model-turnover benchmarks](docs/metal-turnover.md)
 
+The miner uses the available CPU cores to prepare new model weights for the GPU. Across two M1 Max replays per model, ten setup threads produced **2.04–2.06× as many Kepler tickets** and **1.29–1.31× as many TESS tickets** as one thread during the first five seconds of a job. [CPU thread benchmark](docs/metal-turnover.md#cpu-threads-during-metal-job-setup)
+
 ![NEB dashboard mining over TCP, with Kepler active, the last TESS job and recent pool replies](docs/images/metal-miner-dashboard.png)
 
 ## Try it on your Mac

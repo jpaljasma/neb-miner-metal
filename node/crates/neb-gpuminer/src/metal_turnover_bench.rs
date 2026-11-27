@@ -20,6 +20,9 @@ impl MetalScanner {
     ) -> Result<ScreenResult, String> {
         self.productive_range(h, start, n, bound)
     }
+    pub fn set_setup_threads(&mut self, threads: std::num::NonZeroUsize) {
+        self.build_threads = Some(threads.get());
+    }
     pub fn pair_prefix_hash(&self) -> blake3::Hash {
         let table = self.rows.as_ref().unwrap().combos.as_ref().unwrap();
         // SAFETY: synchronous commands have finished writing the published prefix.

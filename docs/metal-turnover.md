@@ -73,6 +73,39 @@ On the reverse transition, six order-balanced five-second trials per slot compar
 
 The CPU oracle covers 131,072 nonces through the end of the nonce range on each checked model. It verifies full and restricted pair-table prefixes, eligible counts, hit sets and exact-target comparisons. A targeted search also located and checked 335 newly admitted Kepler tickets and three rare TESS tickets against the reference, including targets one below each reference ticket. A separate folding test covers repeated values, zero contributions, signed clipping boundaries and modulo-32-bit arithmetic.
 
+## CPU threads during Metal job setup
+
+When a job brings new weights, CPU workers build gradient rows and write the single-row lookup table into shared Metal memory. The foreground scanner uses the available CPU parallelism. The separate TESS look-ahead path uses two threads while Kepler mines.
+
+The `cpu-feed` replay measures how much work Metal completes in the first five seconds after a weight change. Each run warms the old model, starts the clock, installs the new weights and scans with the slot's production pair kernel. Only batches that finish by the deadline contribute tickets. The CPU checks returned candidates and compares the new model's results with an independent oracle over 131,072 nonces before the replay prints a result.
+
+On November 27, 2026, the 32-core M1 Max GPU with 64 GB of unified memory ran two recorded weight changes per model. Each cell gives setup time in milliseconds and millions of Metal tickets completed in the five-second window. Each thread count ran once per job. The second job used different weights and a different header seed. [Scanner revision](https://github.com/jpaljasma/neb-miner-metal/commit/884ed4a)
+
+| Job | 1 thread (ms / M tickets) | 4 threads | 8 threads | 10 threads | Tickets, 10 vs. 1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kepler A | 2,005 / 73.90 | 554 / 129.42 | 306 / 141.54 | 298 / 150.53 | 2.04× |
+| Kepler B | 2,036 / 8.96 | 568 / 16.90 | 351 / 18.30 | 312 / 18.43 | 2.06× |
+| TESS A | 1,081 / 839.56 | 377 / 1,018.68 | 194 / 1,084.68 | 220 / 1,103.76 | 1.31× |
+| TESS B | 1,075 / 1,386.46 | 311 / 1,769.55 | 206 / 1,785.25 | 187 / 1,789.64 | 1.29× |
+
+An earlier run on the same jobs with the direct-read Kepler builder also favored ten threads over one. The ticket ratios were 2.09–2.23× on Kepler and 1.25× on TESS. Eight and ten threads traded places on that revision. Both sets of measurements cover job startup. [Direct-read builder revision](https://github.com/jpaljasma/neb-miner-metal/commit/ee84724)
+
+To repeat the comparison, use the release build, dataset and snapshot directories described below. Slot 0 is Kepler and slot 1 is TESS. Use the same seed and destination oracle for every thread count on a given job. Reverse or rotate the thread order on the next job.
+
+```sh
+bench=node/target/release/examples/metal_turnover
+dataset=build/neb-datasets.bin
+for slot in 0 1; do
+    oracle="build/cpu-feed-oracle-$slot.bin"
+    "$bench" oracle "$dataset" "$new" "$slot" "$oracle" || exit 1
+    for threads in 1 4 8 10; do
+        "$bench" cpu-feed "$dataset" "$old" "$new" "$slot" "$threads" 37 "$oracle" || exit 1
+    done
+done
+```
+
+Each successful run prints `cpu-feed,slot,threads,seed,setup_seconds,completed_tickets`. Divide the last field by 5,000,000 for MH/s across the five-second window.
+
 ## Reproduce the replay
 
 Build the `metal_turnover` Cargo example in release mode with the `metal-bench` feature. Use the pinned mainnet dataset, two distinct same-slot model snapshots in the format produced by `tools/capture_metal_models.py`, and an otherwise idle GPU. Generate the independent CPU oracle for the destination model before timing any GPU arm.
