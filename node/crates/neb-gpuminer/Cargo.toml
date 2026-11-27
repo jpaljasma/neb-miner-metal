@@ -30,6 +30,10 @@ name = "metal_starts"
 required-features = ["metal"]
 
 [[example]]
+name = "metal_turnover"
+required-features = ["metal-bench"]
+
+[[example]]
 name = "metal_selected"
 required-features = ["metal-bench"]
 
