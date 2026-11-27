@@ -55,17 +55,28 @@ inline void qr_word(thread uint &a, thread uint &b, thread uint &c, thread uint 
 inline uint triangular_index(uint b) { return b*(b+1)/2; }
 inline uint triple_index(uint c) { return c*(c+1)*(c+2)/6; }
 
+#if RANK_LAYOUT == 2
+typedef ushort RankWord;
+constant uint live_tag = 1u << 15;
+#else
+typedef uint RankWord;
+constant uint live_tag = 1u << 27;
+#endif
+
 // args: first header chaining value [8], header tail [3], starting nonce,
 // dataset size, ready pairs, triple prefix, complete pair count, target [8],
 // and the four cached BLAKE3 column vectors [16] when HEADER_COLUMNS is enabled.
 // ranks: zero-gradient rows use UINT_MAX; live rows use contiguous ranks.
 kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
-                          device const uint *ranks [[buffer(1)]],
+                          device const RankWord *ranks [[buffer(1)]],
                           device const uint *single [[buffer(2)]],
                           device const uint *combos [[buffer(3)]],
                           device atomic_uint *counts [[buffer(4)]],
                           device uint *hits [[buffer(5)]],
                           device uint *records [[buffer(6)]],
+                          #if RANK_LAYOUT && PAIRS_ONLY
+                          device const uint *live_rows [[buffer(7)]],
+                          #endif
                           uint i [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint tid [[thread_index_in_threadgroup]],
@@ -107,7 +118,25 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     uint4 words[4]={a+init,b+key.lo,c+key.hi,d};
     #endif
     uint live=0, row=0, ids[3]={};
-    #if RANK_QUADS && PAIRS_ONLY
+    #if RANK_LAYOUT && PAIRS_ONLY
+    // Idle rows contribute zero. Below three tags, the low bits hold the sum of
+    // at most two ranks; subtracting the largest also handles a repeated row.
+    uint rank_sum=0, largest=0;
+    #pragma clang loop unroll(full)
+    for(uint j=0;j<4;j++) {
+        uint4 sample=mulhi(words[j],uint4(args[12]));
+        uint4 tagged=uint4(ranks[sample.x],ranks[sample.y],ranks[sample.z],ranks[sample.w]);
+        rank_sum+=tagged.x+tagged.y+tagged.z+tagged.w;
+        if(rank_sum>=3u*live_tag) break;
+        largest=max(largest,max(max(tagged.x,tagged.y),max(tagged.z,tagged.w)));
+    }
+    live=rank_sum/live_tag;
+    if(live==1) row=live_rows[largest-live_tag];
+    if(live==2) {
+        ids[1]=largest-live_tag;
+        ids[0]=(rank_sum & (live_tag-1u))-ids[1];
+    }
+    #elif RANK_QUADS && PAIRS_ONLY
     ids[0]=0xffffffffu;
     #pragma clang loop unroll(full)
     for(uint j=0;j<4;j++) {
@@ -127,6 +156,9 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     for(uint j=0;j<16;j++) {
         uint id=mulhi(words[j/4][j%4],args[12]);
         uint rank=ranks[id];
+        #if RANK_LAYOUT
+        rank=rank ? rank-live_tag : 0xffffffffu;
+        #endif
         if(rank!=0xffffffffu) {
             #if PAIRS_ONLY
             if(live==2){ live=3; break; }
@@ -158,7 +190,7 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     #endif
     uint evaluated=simd_sum(uint(eligible));
     #if COMPACT_TICKETS && !CHECK_RECORDS
-    // The host dispatches up to four 32-lane SIMD groups. Pack eligible tickets
+    // The host dispatches 32-lane SIMD groups. Pack eligible tickets
     // together so the final hash runs on occupied lanes.
     threadgroup PendingTicket pending[SCREEN_GROUP_THREADS];
     threadgroup uint group_counts[(SCREEN_GROUP_THREADS+31)/32];

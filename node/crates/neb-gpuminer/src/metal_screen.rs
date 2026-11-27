@@ -4,8 +4,8 @@ use super::*;
 
 /// Size of the fixed calibration/replay range.
 pub const SCREEN_CAP: u32 = 262144;
-/// Amortize one synchronous GPU submission across four calibration ranges.
-pub const MINING_SCREEN_CAP: u32 = SCREEN_CAP * 4;
+/// Amortize one synchronous GPU submission across sixteen calibration ranges.
+pub const MINING_SCREEN_CAP: u32 = SCREEN_CAP * 16;
 pub const PROBE_CAP: u32 = 4096;
 const SCALAR_CHACHA: u8 = 1;
 const PAIRS_ONLY: u8 = 2;
@@ -18,6 +18,73 @@ const COMPACT_TICKETS: u8 = 128;
 const DEFAULT_SCREEN: u8 = PAIRS_ONLY | SCALAR_CHACHA | HEADER_COLUMNS | RANK_QUADS;
 const SCREEN_GROUP_THREADS: u64 = 128;
 type ScreenArgs = [u32; 40];
+
+pub(super) fn pair_mode(compact_tickets: bool) -> u8 {
+    DEFAULT_SCREEN | if compact_tickets { COMPACT_TICKETS } else { 0 }
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(u8)]
+pub(super) enum RankLayout {
+    #[default]
+    Plain,
+    Tagged32,
+    Tagged16,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PairTuning {
+    pub ranks: RankLayout,
+    pub threads: u64,
+}
+impl Default for PairTuning {
+    fn default() -> Self {
+        Self { ranks: RankLayout::Plain, threads: SCREEN_GROUP_THREADS }
+    }
+}
+
+impl PairTuning {
+    pub(super) fn production(compact_tickets: bool, rows: u32) -> Self {
+        // With at most 16,384 rows, even two maximum ranks cannot carry into bit 15.
+        let ranks = if compact_tickets && rows <= 16_384 { RankLayout::Tagged16 } else { RankLayout::Tagged32 };
+        Self { ranks, threads: SCREEN_GROUP_THREADS }
+    }
+}
+impl RankLayout {
+    pub(super) fn build(self, device: &metal::DeviceRef, ranks: &[u32]) -> Result<Buffer, String> {
+        fn fill<T>(device: &metal::DeviceRef, ranks: &[u32], tag: u32) -> Result<Buffer, String>
+        where
+            T: TryFrom<u32> + Copy,
+        {
+            let storage = shared_buffer(device, size_of::<T>() * ranks.len())?;
+            // SAFETY: this fresh Metal allocation holds ranks.len() aligned u16 or u32 entries.
+            // Only live rows need writes. Metal zeroes idle rows and no command has the buffer yet.
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(storage.contents().cast::<std::mem::MaybeUninit<T>>(), ranks.len())
+            };
+            for (&rank, entry) in ranks.iter().zip(out) {
+                if rank != u32::MAX {
+                    // The sum of two live ranks must fit below one count bit.
+                    if rank >= tag / 2 {
+                        return Err("rank sum exceeds the packed lookup domain".into());
+                    }
+                    entry.write(T::try_from(tag | rank).map_err(|_| "tagged rank overflow")?);
+                }
+            }
+            Ok(storage)
+        }
+        match self {
+            Self::Tagged32 => fill::<u32>(device, ranks, 1 << 27),
+            Self::Tagged16 => fill::<u16>(device, ranks, 1 << 15),
+            Self::Plain => {
+                let storage = shared_buffer(device, std::mem::size_of_val(ranks))?;
+                // SAFETY: fresh, aligned storage exactly fits the source ranks.
+                unsafe { std::ptr::copy_nonoverlapping(ranks.as_ptr(), storage.contents().cast(), ranks.len()) };
+                Ok(storage)
+            }
+        }
+    }
+}
 
 // Finish three independent BLAKE3 columns on the host. Column 1 stops just
 // before message word 3 (the nonce) enters the second half of its G function.
@@ -57,6 +124,8 @@ fn prepare_header(args: &mut ScreenArgs, header: &[u8; 76], columns: bool) {
 }
 pub struct Screen {
     pair: ComputePipelineState,
+    tuning: PairTuning,
+    reference_tuning: PairTuning,
     general: Option<ComputePipelineState>,
     check: ComputePipelineState,
     parameters: Buffer,
@@ -75,12 +144,21 @@ pub struct ScreenResult {
     pub records: Vec<[u32; 9]>,
 }
 impl Screen {
+    #[cfg(feature = "metal-bench")]
     pub(super) fn variant(device: &metal::DeviceRef, check: bool, mask: u8) -> Result<ComputePipelineState, String> {
+        Self::tuned_variant(device, check, mask, PairTuning::default())
+    }
+    pub(super) fn tuned_variant(
+        device: &metal::DeviceRef,
+        check: bool,
+        mask: u8,
+        tuning: PairTuning,
+    ) -> Result<ComputePipelineState, String> {
         let src = format!(
             concat!(
                 "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n",
                 "#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n",
-                "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n{}",
+                "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n#define RANK_LAYOUT {}\n{}",
             ),
             u8::from(check),
             u8::from(mask & SCALAR_CHACHA != 0),
@@ -90,31 +168,34 @@ impl Screen {
             u8::from(mask & GROUP_ARGS != 0),
             u8::from(mask & RANK_QUADS != 0),
             u8::from(mask & COMPACT_TICKETS != 0),
-            SCREEN_GROUP_THREADS,
+            tuning.threads,
+            tuning.ranks as u8,
             include_str!("../../../../pow/gpu/kep1_screen.metal")
         );
         let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
         let f = lib.get_function("lookup_screen", None)?;
         let pipeline = device.new_compute_pipeline_state_with_function(&f)?;
-        if mask & COMPACT_TICKETS != 0
-            && (pipeline.thread_execution_width() != 32
-                || pipeline.max_total_threads_per_threadgroup() < SCREEN_GROUP_THREADS)
-        {
-            return Err("ticket packing requires 32-lane SIMD groups and 128 threads per group".into());
+        if pipeline.thread_execution_width() != 32 || pipeline.max_total_threads_per_threadgroup() < tuning.threads {
+            return Err(format!("screen requires 32-lane SIMD and {} threads per group", tuning.threads));
         }
         Ok(pipeline)
     }
     #[cfg(feature = "metal-bench")]
-    pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState, mode: u8) {
+    pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState, mode: u8, tuning: PairTuning) {
         self.pair = p;
         self.mode = mode;
+        self.tuning = tuning;
     }
-    pub fn new(device: &Device, compact_tickets: bool) -> Result<Self, String> {
-        let mode = DEFAULT_SCREEN | if compact_tickets { COMPACT_TICKETS } else { 0 };
+    pub fn new(device: &Device, compact_tickets: bool, rows: u32) -> Result<Self, String> {
+        let mode = pair_mode(compact_tickets);
+        let tuning = PairTuning::production(compact_tickets, rows);
+        let reference_tuning = PairTuning { ranks: tuning.ranks, ..Default::default() };
         Ok(Self {
-            pair: Self::variant(device, false, mode)?,
+            pair: Self::tuned_variant(device, false, mode, tuning)?,
+            tuning,
+            reference_tuning,
             general: None,
-            check: Self::variant(device, true, 0)?,
+            check: Self::tuned_variant(device, true, 0, reference_tuning)?,
             parameters: shared_buffer(device, size_of::<ScreenArgs>())?,
             #[cfg(feature = "metal-bench")]
             mode,
@@ -129,7 +210,7 @@ impl Screen {
     pub(super) fn scan(
         &mut self,
         queue: &CommandQueue,
-        rows: &ModelRows,
+        rows: &mut ModelRows,
         n: u32,
         header: &[u8; 80],
         start: u32,
@@ -145,7 +226,7 @@ impl Screen {
         {
             return Err("invalid screen range".into());
         }
-        let tables = rows.combos.as_ref().ok_or("combination tables unavailable")?;
+        let tables = rows.combos.as_mut().ok_or("combination tables unavailable")?;
         let single = rows.singles.as_ref().ok_or("single table unavailable")?;
         let pipeline = if check {
             &self.check
@@ -154,8 +235,13 @@ impl Screen {
         } else {
             match &mut self.general {
                 Some(pipeline) => pipeline,
-                empty @ None => empty.insert(Self::variant(queue.device(), false, 0)?),
+                empty @ None => empty.insert(Self::tuned_variant(queue.device(), false, 0, self.reference_tuning)?),
             }
+        };
+        let tuning = if check || arity > 2 { self.reference_tuning } else { self.tuning };
+        let ranks = match &mut tables.rank_buffers[tuning.ranks as usize] {
+            Some(table) => &*table,
+            empty @ None => &*empty.insert(tuning.ranks.build(queue.device(), &tables.host_ranks)?),
         };
         let mut inline_args = [0u32; 40];
         #[cfg(feature = "metal-bench")]
@@ -201,12 +287,14 @@ impl Screen {
             } else {
                 enc.set_bytes(0, 96, inline_args.as_ptr().cast());
             }
-            for (i, buf) in
-                [&tables.ranks, single, &tables.values, &self.counts, &self.hits, &self.records].iter().enumerate()
+            for (i, buf) in [ranks, single, &tables.values, &self.counts, &self.hits, &self.records].iter().enumerate()
             {
                 enc.set_buffer((i + 1) as u64, Some(buf), 0);
             }
-            enc.dispatch_threads(MTLSize::new(count as u64, 1, 1), MTLSize::new(SCREEN_GROUP_THREADS, 1, 1));
+            if !check && arity <= 2 && !matches!(tuning.ranks, RankLayout::Plain) {
+                enc.set_buffer(7, Some(&tables.ids), 0);
+            }
+            enc.dispatch_threads(MTLSize::new(count as u64, 1, 1), MTLSize::new(tuning.threads, 1, 1));
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();

@@ -14,10 +14,11 @@ mod replay {
     use neb_engines::table::Table;
     use neb_gpuminer::{
         Scanner,
-        metal_scanner::{MINING_SCREEN_CAP, MetalScanner, SCREEN_CAP},
+        metal_scanner::{MetalScanner, SCREEN_CAP},
     };
     use neb_pow::shares::{Arch, Model, ShareBuffers, load_datasets, share_indices};
     use std::{fs, path::Path, time::Instant};
+    const REPLAY_BATCH: u32 = SCREEN_CAP * 4;
 
     fn screen_variants(
         s: &mut MetalScanner,
@@ -27,12 +28,15 @@ mod replay {
         phase: &str,
         hold: Option<u8>,
     ) -> Result<(), String> {
-        let hot = matches!(phase, "hot" | "hot-confirm" | "simd" | "simd-confirm");
+        let rank_tune = matches!(phase, "rank-tune" | "rank-confirm");
+        let hot = rank_tune || matches!(phase, "hot" | "hot-confirm" | "simd" | "simd-confirm");
         let (masks, blocks, seed): (Vec<u8>, u32, u8) = match (phase, hold) {
             ("hot", _) => ((0..8).map(|factors| 3 | (factors << 3)).collect(), 64, 73),
             ("hot-confirm", _) => (vec![3, 11, 19, 27], 128, 149),
             ("simd", _) => (vec![11, 75, 139, 203], 64, 91),
             ("simd-confirm", _) => (vec![11, 75, 139, 203], 128, 193),
+            ("rank-tune", _) => ((0..9).collect(), 32, 111),
+            ("rank-confirm", _) => ((0..9).collect(), 64, 213),
             ("variants", None) => ((0..8).collect(), 32, 39),
             ("variants", Some(mask)) => {
                 let mut controls = vec![0, mask & 2, mask & 3, mask & 6, mask];
@@ -42,7 +46,10 @@ mod replay {
             }
             _ => return Err("unknown screen replay".into()),
         };
-        let pipes: Vec<_> = masks.iter().map(|&m| s.compile_screen_variant(m)).collect::<Result<_, _>>()?;
+        let pipes: Vec<_> = masks
+            .iter()
+            .map(|&m| if rank_tune { s.compile_rank_tuning(m) } else { s.compile_screen_variant(m) })
+            .collect::<Result<_, _>>()?;
         let header = [0xb4; 80];
         let mut easy = [0xff; 32];
         easy[31] = 63;
@@ -51,9 +58,9 @@ mod replay {
         let mut boundary_baseline = None;
         for pipe in &pipes {
             s.use_screen_variant(pipe)?;
-            if phase.starts_with("simd") {
+            if phase.starts_with("simd") || rank_tune {
                 let mut boundary = Vec::new();
-                for count in [1, 31, 32, 33, 127, 128, 129, 255] {
+                for count in [1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4096] {
                     let mut r = s.screen_range(&header, u32::MAX - (count - 1), count, &[0xff; 32], 2, false)?;
                     r.hits.sort_unstable();
                     if r.hits.len() != r.evaluated as usize {
@@ -97,7 +104,7 @@ mod replay {
             }
             baseline = Some(result);
         }
-        let count = if hot { 8 } else { 4 } * MINING_SCREEN_CAP;
+        let count = if hot { 8 } else { 4 } * REPLAY_BATCH;
         let mut bound = [0xff; 32];
         bound[29..].fill(0);
         for block in 0..=blocks {
@@ -122,8 +129,8 @@ mod replay {
                 let mut hits = vec![];
                 let mut gpu = 0.;
                 let t = Instant::now();
-                for off in (0..count).step_by(MINING_SCREEN_CAP as usize) {
-                    let r = s.screen_range(&h, block * count + off, MINING_SCREEN_CAP, &bound, 2, false)?;
+                for off in (0..count).step_by(REPLAY_BATCH as usize) {
+                    let r = s.screen_range(&h, block * count + off, REPLAY_BATCH, &bound, 2, false)?;
                     evaluated += r.evaluated;
                     hits.extend(r.hits);
                     gpu += r.gpu_s;
@@ -181,11 +188,13 @@ mod replay {
 
     pub fn run() -> Result<(), String> {
         let args: Vec<_> = std::env::args().skip(1).collect();
-        let dispatch = args.len() == 3 && args[2] == "dispatch";
+        let feed = args.len() == 3 && matches!(args[2].as_str(), "feed" | "feed-confirm");
+        let dispatch = feed || (args.len() == 3 && args[2] == "dispatch");
         let upload = args.len() == 3 && args[2] == "lookup-upload";
         let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
-        let hot = args.get(2).is_some_and(|m| matches!(m.as_str(), "hot" | "hot-confirm" | "simd" | "simd-confirm"))
-            && args.len() == 3;
+        let hot = args.get(2).is_some_and(|m| {
+            matches!(m.as_str(), "hot" | "hot-confirm" | "simd" | "simd-confirm" | "rank-tune" | "rank-confirm")
+        }) && args.len() == 3;
         let hold = if variants && args.len() == 4 {
             let id = args[3].parse::<u8>().map_err(|_| "bad mask")?;
             if !(1..=7).contains(&id) {
@@ -197,7 +206,7 @@ mod replay {
         };
         if args.len() != 2 && !dispatch && !variants && !upload && !hot {
             return Err(
-                "DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm]".into(),
+                "DATASET SNAPSHOT_DIR [dispatch | feed | feed-confirm | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm | rank-tune | rank-confirm]".into(),
             );
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
@@ -206,6 +215,8 @@ mod replay {
             println!("block,slot,mapped,table_bytes,wall_ms");
         } else if variants || hot {
             println!("block,slot,mask,screened,evaluated,wall_ms,gpu_ms");
+        } else if feed {
+            println!("block,slot,mask,screened,evaluated,wall_ms,gpu_ms,slowest_dispatch_ms");
         } else if dispatch {
             println!("block,slot,batch,screened,evaluated,wall_ms,gpu_ms");
         } else {
@@ -231,25 +242,57 @@ mod replay {
                 continue;
             }
             if dispatch {
-                let total = 4_194_304;
-                for block in 0..=32u32 {
-                    let mut h = [slot as u8 + 37; 80];
+                let total = if feed { 8 * REPLAY_BATCH } else { 4 * REPLAY_BATCH };
+                let (blocks, seed): (u32, u8) = if args[2] == "feed-confirm" {
+                    (96, 217)
+                } else if feed {
+                    (48, 137)
+                } else {
+                    (32, 37)
+                };
+                let confirm_pipelines = if args[2] == "feed-confirm" {
+                    Some([s.compile_rank_tuning(0)?, s.compile_rank_tuning(if slot == 0 { 1 } else { 2 })?])
+                } else {
+                    None
+                };
+                for block in 0..=blocks {
+                    let mut h = [slot as u8 + seed; 80];
                     h[0..4].copy_from_slice(&block.to_le_bytes());
-                    let start = if block == 32 { u32::MAX - (total - 1) } else { block * total };
+                    let start = if block == blocks { u32::MAX - (total - 1) } else { block * total };
                     let mut bound = [0xff; 32];
                     bound[30..].fill(0);
-                    let mut order = [SCREEN_CAP, MINING_SCREEN_CAP];
-                    if (block + slot as u32).is_multiple_of(2) {
+                    if feed && block != 0 {
+                        bound[29] = 0;
+                    }
+                    // Zero is the previous production kernel with its original batch.
+                    let mut order = match (feed, confirm_pipelines.is_some()) {
+                        (true, true) => vec![0, REPLAY_BATCH, REPLAY_BATCH * 2, REPLAY_BATCH * 4],
+                        (true, false) => vec![REPLAY_BATCH, REPLAY_BATCH * 2, REPLAY_BATCH * 4],
+                        _ => vec![SCREEN_CAP, REPLAY_BATCH],
+                    };
+                    let arms = order.len();
+                    if feed {
+                        order.rotate_left((block as usize + slot) % arms);
+                    }
+                    let cycle = if feed { block / arms as u32 } else { block + slot as u32 };
+                    if cycle.is_multiple_of(2) {
                         order.reverse();
                     }
                     let mut expected = None;
-                    for batch in order {
+                    for arm in order {
+                        if let Some(pipelines) = &confirm_pipelines {
+                            s.use_screen_variant(&pipelines[usize::from(arm != 0)])?;
+                        }
+                        let batch = if arm == 0 { REPLAY_BATCH } else { arm };
                         let mut evaluated = 0;
                         let mut hits = vec![];
                         let mut gpu_s = 0.;
+                        let mut slowest: f64 = 0.;
                         let t = Instant::now();
                         for offset in (0..total).step_by(batch as usize) {
+                            let start_dispatch = Instant::now();
                             let r = s.screen_range(&h, start + offset, batch, &bound, 2, false)?;
+                            slowest = slowest.max(start_dispatch.elapsed().as_secs_f64());
                             evaluated += r.evaluated;
                             gpu_s += r.gpu_s;
                             hits.extend(r.hits);
@@ -271,11 +314,21 @@ mod replay {
                             expected = Some((evaluated, hits));
                         }
                         if block > 0 {
-                            println!(
-                                "{block},{slot},{batch},{total},{evaluated},{:.6},{:.6}",
-                                wall * 1000.,
-                                gpu_s * 1000.
-                            );
+                            if feed {
+                                println!(
+                                    "{block},{slot},{},{total},{evaluated},{:.6},{:.6},{:.6}",
+                                    arm / REPLAY_BATCH,
+                                    wall * 1000.,
+                                    gpu_s * 1000.,
+                                    slowest * 1000.
+                                );
+                            } else {
+                                println!(
+                                    "{block},{slot},{batch},{total},{evaluated},{:.6},{:.6}",
+                                    wall * 1000.,
+                                    gpu_s * 1000.
+                                );
+                            }
                         }
                     }
                 }
