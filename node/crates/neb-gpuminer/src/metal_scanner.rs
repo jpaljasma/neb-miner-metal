@@ -229,6 +229,7 @@ pub struct MetalScanner {
     dispatch_size: usize,
     host_mask: u8,
     allow_screen: bool,
+    compact_tickets: bool,
     ahead: Option<TessAhead>,
     build_threads: Option<usize>,
     allow_reuse: bool,
@@ -247,6 +248,12 @@ pub struct MetalScanner {
 }
 
 impl MetalScanner {
+    /// Both slots group rank loads. Packing eligible lanes together also paid off on TESS.
+    pub fn for_slot(dataset: SharedDataset, slot: usize) -> Result<Self, String> {
+        let mut scanner = Self::open(dataset)?;
+        scanner.compact_tickets = slot == 1;
+        Ok(scanner)
+    }
     /// Compare lookup construction and upload, including the destination allocation.
     #[cfg(feature = "metal-bench")]
     pub fn benchmark_single_lookup(&self, table: &Table, threads: usize, mapped: bool) -> Result<Buffer, String> {
@@ -277,6 +284,7 @@ impl MetalScanner {
             dispatch_size: DISPATCH,
             host_mask: 0,
             allow_screen: false,
+            compact_tickets: false,
             ahead: None,
             build_threads: None,
             allow_reuse: true,
@@ -584,7 +592,7 @@ impl MetalScanner {
         check: bool,
     ) -> Result<ScreenResult, String> {
         if self.screen.is_none() {
-            self.screen = Some(metal_screen::Screen::new(&self.device)?);
+            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets)?);
         }
         self.screen.as_mut().unwrap().scan(
             &self.queue,
@@ -709,7 +717,7 @@ impl MetalScanner {
     }
     pub fn use_screen_variant(&mut self, variant: &PairScreenVariant) -> Result<(), String> {
         if self.screen.is_none() {
-            self.screen = Some(metal_screen::Screen::new(&self.device)?);
+            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets)?);
         }
         self.screen.as_mut().unwrap().set_pair_pipeline(variant.pipeline.clone(), variant.mode);
         Ok(())

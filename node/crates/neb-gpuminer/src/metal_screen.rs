@@ -13,7 +13,10 @@ const MAPPED_ARGS: u8 = 4;
 const HEADER_COLUMNS: u8 = 8;
 const HIGH_WORD: u8 = 16;
 const GROUP_ARGS: u8 = 32;
-const DEFAULT_SCREEN: u8 = PAIRS_ONLY | SCALAR_CHACHA | HEADER_COLUMNS;
+const RANK_QUADS: u8 = 64;
+const COMPACT_TICKETS: u8 = 128;
+const DEFAULT_SCREEN: u8 = PAIRS_ONLY | SCALAR_CHACHA | HEADER_COLUMNS | RANK_QUADS;
+const SCREEN_GROUP_THREADS: u64 = 128;
 type ScreenArgs = [u32; 40];
 
 // Finish three independent BLAKE3 columns on the host. Column 1 stops just
@@ -74,32 +77,47 @@ pub struct ScreenResult {
 impl Screen {
     pub(super) fn variant(device: &metal::DeviceRef, check: bool, mask: u8) -> Result<ComputePipelineState, String> {
         let src = format!(
-            "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n{}",
+            concat!(
+                "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n",
+                "#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n",
+                "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n{}",
+            ),
             u8::from(check),
             u8::from(mask & SCALAR_CHACHA != 0),
             u8::from(mask & PAIRS_ONLY != 0),
             u8::from(mask & HEADER_COLUMNS != 0),
             u8::from(mask & HIGH_WORD != 0),
             u8::from(mask & GROUP_ARGS != 0),
+            u8::from(mask & RANK_QUADS != 0),
+            u8::from(mask & COMPACT_TICKETS != 0),
+            SCREEN_GROUP_THREADS,
             include_str!("../../../../pow/gpu/kep1_screen.metal")
         );
         let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
         let f = lib.get_function("lookup_screen", None)?;
-        device.new_compute_pipeline_state_with_function(&f)
+        let pipeline = device.new_compute_pipeline_state_with_function(&f)?;
+        if mask & COMPACT_TICKETS != 0
+            && (pipeline.thread_execution_width() != 32
+                || pipeline.max_total_threads_per_threadgroup() < SCREEN_GROUP_THREADS)
+        {
+            return Err("ticket packing requires 32-lane SIMD groups and 128 threads per group".into());
+        }
+        Ok(pipeline)
     }
     #[cfg(feature = "metal-bench")]
     pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState, mode: u8) {
         self.pair = p;
         self.mode = mode;
     }
-    pub fn new(device: &Device) -> Result<Self, String> {
+    pub fn new(device: &Device, compact_tickets: bool) -> Result<Self, String> {
+        let mode = DEFAULT_SCREEN | if compact_tickets { COMPACT_TICKETS } else { 0 };
         Ok(Self {
-            pair: Self::variant(device, false, DEFAULT_SCREEN)?,
+            pair: Self::variant(device, false, mode)?,
             general: None,
             check: Self::variant(device, true, 0)?,
             parameters: shared_buffer(device, size_of::<ScreenArgs>())?,
             #[cfg(feature = "metal-bench")]
-            mode: DEFAULT_SCREEN,
+            mode,
             prefix: None,
             counts: shared_buffer(device, 8)?,
             hits: shared_buffer(device, MINING_SCREEN_CAP as usize * 4)?,
@@ -188,7 +206,7 @@ impl Screen {
             {
                 enc.set_buffer((i + 1) as u64, Some(buf), 0);
             }
-            enc.dispatch_threads(MTLSize::new(count as u64, 1, 1), MTLSize::new(128, 1, 1));
+            enc.dispatch_threads(MTLSize::new(count as u64, 1, 1), MTLSize::new(SCREEN_GROUP_THREADS, 1, 1));
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();

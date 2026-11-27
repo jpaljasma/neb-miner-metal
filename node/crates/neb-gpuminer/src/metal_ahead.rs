@@ -35,7 +35,7 @@ impl TessAhead {
                 return Ok(());
             }
         }
-        let mut fresh = Box::new(MetalScanner::open(self.dataset.clone())?);
+        let mut fresh = Box::new(MetalScanner::for_slot(self.dataset.clone(), 1)?);
         fresh.build_threads = Some(2);
         fresh.enable_screen();
         fresh.set_weights(&model)?;

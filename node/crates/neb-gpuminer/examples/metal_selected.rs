@@ -27,10 +27,12 @@ mod replay {
         phase: &str,
         hold: Option<u8>,
     ) -> Result<(), String> {
-        let hot = matches!(phase, "hot" | "hot-confirm");
+        let hot = matches!(phase, "hot" | "hot-confirm" | "simd" | "simd-confirm");
         let (masks, blocks, seed): (Vec<u8>, u32, u8) = match (phase, hold) {
             ("hot", _) => ((0..8).map(|factors| 3 | (factors << 3)).collect(), 64, 73),
             ("hot-confirm", _) => (vec![3, 11, 19, 27], 128, 149),
+            ("simd", _) => (vec![11, 75, 139, 203], 64, 91),
+            ("simd-confirm", _) => (vec![11, 75, 139, 203], 128, 193),
             ("variants", None) => ((0..8).collect(), 32, 39),
             ("variants", Some(mask)) => {
                 let mut controls = vec![0, mask & 2, mask & 3, mask & 6, mask];
@@ -46,8 +48,24 @@ mod replay {
         easy[31] = 63;
         let mut reference = ShareBuffers::new();
         let mut baseline = None;
+        let mut boundary_baseline = None;
         for pipe in &pipes {
             s.use_screen_variant(pipe)?;
+            if phase.starts_with("simd") {
+                let mut boundary = Vec::new();
+                for count in [1, 31, 32, 33, 127, 128, 129, 255] {
+                    let mut r = s.screen_range(&header, u32::MAX - (count - 1), count, &[0xff; 32], 2, false)?;
+                    r.hits.sort_unstable();
+                    if r.hits.len() != r.evaluated as usize {
+                        return Err("maximum target missed an eligible ticket".into());
+                    }
+                    boundary.push(r.hits);
+                }
+                if boundary_baseline.as_ref().is_some_and(|expected| expected != &boundary) {
+                    return Err("partial SIMD group changed eligible nonces".into());
+                }
+                boundary_baseline = Some(boundary);
+            }
             let mut r = s.screen_range(&header, u32::MAX - 4095, 4096, &easy, 2, false)?;
             r.hits.sort_unstable();
             for &nonce in &r.hits {
@@ -166,7 +184,8 @@ mod replay {
         let dispatch = args.len() == 3 && args[2] == "dispatch";
         let upload = args.len() == 3 && args[2] == "lookup-upload";
         let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
-        let hot = args.get(2).is_some_and(|m| m == "hot" || m == "hot-confirm") && args.len() == 3;
+        let hot = args.get(2).is_some_and(|m| matches!(m.as_str(), "hot" | "hot-confirm" | "simd" | "simd-confirm"))
+            && args.len() == 3;
         let hold = if variants && args.len() == 4 {
             let id = args[3].parse::<u8>().map_err(|_| "bad mask")?;
             if !(1..=7).contains(&id) {
@@ -178,7 +197,7 @@ mod replay {
         };
         if args.len() != 2 && !dispatch && !variants && !upload && !hot {
             return Err(
-                "DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm]".into(),
+                "DATASET SNAPSHOT_DIR [dispatch | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm]".into(),
             );
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
@@ -200,7 +219,7 @@ mod replay {
             if hash != blake3::Hash::from(model.weights_hash()).to_hex().as_str() {
                 return Err("snapshot mismatch".into());
             }
-            let mut s = MetalScanner::open(ds.clone())?;
+            let mut s = MetalScanner::for_slot(ds.clone(), slot)?;
             if upload {
                 lookup_upload(&s, &model, &*ds, slot)?;
                 continue;

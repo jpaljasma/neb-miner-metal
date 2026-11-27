@@ -69,7 +69,7 @@ mod apple {
     fn mine(addr: &str, datasets: Vec<SharedDataset>, selective: bool, tess_ahead: bool) -> Result<(), String> {
         let mut lanes = Vec::new();
         for (slot, dataset) in datasets.into_iter().enumerate() {
-            let mut scanner = MetalScanner::open(dataset.clone())?;
+            let mut scanner = MetalScanner::for_slot(dataset.clone(), slot)?;
             if slot == 1 && tess_ahead {
                 scanner.enable_tess_ahead().listen();
             }

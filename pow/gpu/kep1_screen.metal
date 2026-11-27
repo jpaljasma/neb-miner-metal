@@ -13,6 +13,9 @@ constant uchar schedule[7][16] = {{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
 {9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7},
 {11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13}};
 struct Hash { uint4 lo, hi; };
+#if COMPACT_TICKETS
+struct PendingTicket { Hash key; uint nonce, digest_word; };
+#endif
 inline uint4 rot(uint4 x, uint k) { return (x<<k) | (x>>(32-k)); }
 inline void mix(thread uint4 &a, thread uint4 &b, thread uint4 &c, thread uint4 &d, uint4 x, uint4 y) {
     a+=b+x; d=rot(d^a,16); c+=d; b=rot(b^c,20);
@@ -104,6 +107,23 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     uint4 words[4]={a+init,b+key.lo,c+key.hi,d};
     #endif
     uint live=0, row=0, ids[3]={};
+    #if RANK_QUADS && PAIRS_ONLY
+    ids[0]=0xffffffffu;
+    #pragma clang loop unroll(full)
+    for(uint j=0;j<4;j++) {
+        uint4 sample=mulhi(words[j],uint4(args[12]));
+        uint4 rank=uint4(ranks[sample.x],ranks[sample.y],ranks[sample.z],ranks[sample.w]);
+        bool4 active=rank!=0xffffffffu;
+        uint4 used=select(uint4(0),uint4(1),active);
+        live+=used.x+used.y+used.z+used.w;
+        if(live>2) break;
+        ids[0]=min(ids[0],min(min(rank.x,rank.y),min(rank.z,rank.w)));
+        uint4 valid=select(uint4(0),rank,active);
+        ids[1]=max(ids[1],max(max(valid.x,valid.y),max(valid.z,valid.w)));
+        sample=select(uint4(0),sample,active);
+        row=max(row,max(max(sample.x,sample.y),max(sample.z,sample.w)));
+    }
+    #else
     for(uint j=0;j<16;j++) {
         uint id=mulhi(words[j/4][j%4],args[12]);
         uint rank=ranks[id];
@@ -116,6 +136,7 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
             if(live>3) break;
         }
     }
+    #endif
     device const uint *digest=single+1;
     bool eligible=live<=1;
     if(live==1) digest=single+9*(row+1)+1;
@@ -136,12 +157,40 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     }
     #endif
     uint evaluated=simd_sum(uint(eligible));
+    #if COMPACT_TICKETS && !CHECK_RECORDS
+    // The host dispatches up to four 32-lane SIMD groups. Pack eligible tickets
+    // together so the final hash runs on occupied lanes.
+    threadgroup PendingTicket pending[SCREEN_GROUP_THREADS];
+    threadgroup uint group_counts[(SCREEN_GROUP_THREADS+31)/32];
+    uint group=tid/32;
+    uint rank_in_group=simd_prefix_exclusive_sum(uint(eligible));
+    if(lane==0) group_counts[group]=evaluated;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint before=0,total=0;
+    for(uint g=0;g<(group_size+31)/32;g++) {
+        uint n=group_counts[g];
+        if(g<group) before+=n;
+        total+=n;
+    }
+    if(tid==0 && total) atomic_fetch_add_explicit(counts,total,memory_order_relaxed);
+    if(eligible) {
+        uint address=live<2 ? uint(digest-single) : (uint(digest-combos)|0x80000000u);
+        pending[before+rank_in_group]={key,nonce,address};
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid>=total) return;
+    PendingTicket item=pending[tid];
+    key=item.key;
+    nonce=item.nonce;
+    digest=(item.digest_word>>31 ? combos : single)+(item.digest_word&0x7fffffffu);
+    #else
     if(lane==0 && evaluated) atomic_fetch_add_explicit(counts,evaluated,memory_order_relaxed);
     #if CHECK_RECORDS
     records[9*i]=uint(eligible);
     if(!eligible) for(uint j=0;j<8;j++) records[9*i+1+j]=0;
     #endif
     if(!eligible) return;
+    #endif
     for(uint j=0;j<8;j++) block[j]=digest[j];
     for(uint j=0;j<4;j++) {block[8+j]=key.lo[j];block[12+j]=key.hi[j];}
     #if HIGH_WORD && !CHECK_RECORDS

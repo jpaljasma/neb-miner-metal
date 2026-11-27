@@ -111,6 +111,24 @@ The eight-way screen used 64 order-balanced blocks per model. Explicit threadgro
 
 The cache alone gave the highest confirmed throughput on both models and exceeded the current 0.5% point-estimate cutoff. Run `metal_selected DATASET SNAPSHOT_DIR hot` for the factorial and `metal_selected DATASET FRESH_SNAPSHOT_DIR hot-confirm` for confirmation. Save the CSV output and run `python3 tools/analyze_metal_factorial.py FILE.csv` for the paired estimates and 90% intervals. The masks add bits 8, 16 and 32 for cached columns, high-word filtering and threadgroup staging to the scalar pair baseline of 3.
 
+### Kepler rank lookups and SIMD-group ticket packing
+
+The Kepler screen now reads four sample ranks at a time and counts the live rows in each group of four. It can discard a nonce once the count exceeds two. Among eligible nonces it keeps the same single or pair digest, including pairs that draw the same row twice.
+
+TESS also packs eligible tickets together before the final BLAKE3 hash. Each 32-lane SIMD group uses a prefix sum to assign positions in a threadgroup buffer. A packed ticket carries its existing key, nonce and digest offset. The remaining lanes finish the ticket hashes without recalculating keys. On Kepler, the packing step cost more than it saved on the holdout model, so Kepler uses grouped rank reads alone. Metal reports 6,160 bytes of static threadgroup memory for the TESS pipeline and zero for Kepler.
+
+| Holdout gain over the cached pair kernel | Kepler | TESS |
+| --- | ---: | ---: |
+| Four rank reads at a time | **+13.92%** (+13.08% to +14.76%) | +11.74% (+10.66% to +12.81%) |
+| SIMD-group ticket packing | −3.74% (−4.48% to −3.02%) | +5.36% (+4.25% to +6.39%) |
+| Both | +7.26% (+6.56% to +7.93%) | **+13.41%** (+12.46% to +14.37%) |
+
+Intervals are 90% paired bootstraps. The initial screen used 64 order-balanced blocks per model. Confirmation used 128 blocks on fresh snapshots, each with the same 8,388,608 raw nonces in all four configurations. Hit lists and evaluated counts matched the baseline, including short final SIMD groups. Returned candidates in the correctness probes matched the CPU reference.
+
+Model weights strongly affect absolute rates. The selected Kepler kernel processed a median 46.12 M completed tickets/s on the first snapshot and 9.29 M on the second. The eligible fractions were 4.32% and 0.72%, respectively. The selected TESS kernel reached 267.70 M and 339.18 M completed tickets/s. These are prepared-table scan rates. Reproduce them with `metal_selected DATASET SNAPSHOT_DIR simd` and `metal_selected DATASET FRESH_SNAPSHOT_DIR simd-confirm`, then pass each CSV to `tools/analyze_metal_factorial.py`.
+
+On those two Kepler snapshots the GPU screened 1.07 and 1.30 billion raw nonces/s. At those scan rates, reaching 100 million completed tickets/s would require evaluating 9.4% and 7.7% of the nonces, respectively, before accounting for job setup.
+
 ## Ahead-of-job TESS preparation
 
 [Suprminer v1.9.62](https://github.com/ocminer/suprminer/releases/tag/v1.9.62) prepares announced TESS models during Kepler on selected Linux RTX 50 cards. The Metal adapter supports this scheduling idea with `--selective --tess-ahead`. Its input is a standard `mining.set_model` for TESS received while a Kepler job remains active. The adapter waits 100 ms to let an ordinary immediate job notification take precedence. A separate scanner validates the weights, builds the CPU table with up to two threads, and prepares the GPU pair table in slices. Each slot retains its own active scanner. The authoritative TESS job adopts the prepared scanner only on an exact weight match. An incorrect hint, missing hint or unfinished preparation leaves the normal job path available.
