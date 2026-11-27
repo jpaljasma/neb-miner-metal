@@ -77,6 +77,9 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
                           #if RANK_LAYOUT && PAIRS_ONLY
                           device const uint *live_rows [[buffer(7)]],
                           #endif
+                          #if RECOVER_THREE
+                          device const uint *support [[buffer(8)]],
+                          #endif
                           uint i [[thread_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint tid [[thread_index_in_threadgroup]],
@@ -185,6 +188,39 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
             uint low=min(min(ids[0],ids[1]),ids[2]);
             uint middle=ids[0]+ids[1]+ids[2]-low-high;
             digest=combos+8*(args[15]+triple_index(high)+triangular_index(middle)+low);
+        }
+    }
+    #endif
+    #if RECOVER_THREE
+    if(live==3) {
+        uint r[3]={}, samples_found=0;
+        for(uint k=0;k<16;k++) {
+            uint tag=ranks[mulhi(words[k/4][k%4],args[12])];
+            if(tag) {
+                if(samples_found<3) r[samples_found]=tag-live_tag;
+                if(++samples_found>3) break;
+            }
+        }
+        if(samples_found==3) {
+            uint p01=triangular_index(max(r[0],r[1]))+min(r[0],r[1]);
+            uint p02=triangular_index(max(r[0],r[2]))+min(r[0],r[2]);
+            uint p12=triangular_index(max(r[1],r[2]))+min(r[1],r[2]);
+            bool valid=max(p01,max(p02,p12))<args[13];
+            for(uint w=0;valid && w<SUPPORT_WORDS;w++)
+                valid=(support[SUPPORT_WORDS*r[0]+w]&support[SUPPORT_WORDS*r[1]+w]&support[SUPPORT_WORDS*r[2]+w])==0;
+            if(valid) {
+                for(uint j=0;j<8;j++) block[j]=combos[8*p01+j]+combos[8*p02+j]+combos[8*p12+j]+single[1+j]
+                    -single[9*(live_rows[r[0]]+1)+1+j]-single[9*(live_rows[r[1]]+1)+1+j]-single[9*(live_rows[r[2]]+1)+1+j];
+                for(uint j=0;j<4;j++){block[8+j]=key.lo[j];block[12+j]=key.hi[j];}
+                Hash third=compress({iv_lo,iv_hi},block,64,11,args);
+                bool hit=true;
+                for(int j=7;j>=0;j--) {
+                    uint v=j>=4 ? third.hi[j-4] : third.lo[j];
+                    if(v!=args[16+j]) {hit=v<args[16+j];break;}
+                }
+                atomic_fetch_add_explicit(counts,1u,memory_order_relaxed);
+                if(hit) hits[atomic_fetch_add_explicit(counts+1,1u,memory_order_relaxed)]=nonce;
+            }
         }
     }
     #endif

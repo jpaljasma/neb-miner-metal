@@ -4,20 +4,12 @@ import asyncio
 import base64
 import json
 from pathlib import Path
-import ssl
-from urllib.parse import urlsplit
 
-from test_metal_stratum import ROOT, request
+from test_metal_stratum import ROOT, open_pool, request
 
 
 async def capture(args):
-    url = urlsplit(args.pool)
-    if url.scheme != "stratum+ssl" or not url.hostname or not url.port:
-        raise ValueError("requires a TLS Stratum URL")
-    ctx = ssl.create_default_context()
-    if not ctx.get_ca_certs():
-        ctx.load_verify_locations("/etc/ssl/cert.pem")
-    reader, writer = await asyncio.open_connection(url.hostname, url.port, ssl=ctx, limit=262144)
+    reader, writer = await open_pool(args.pool)
     models, captured = {}, {0: set(), 1: set()}
     try:
         request(writer, 1, "mining.subscribe", ["neb-miner-metal/replay"])

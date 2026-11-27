@@ -55,7 +55,7 @@ class ModelStats:
 class Session:
     def __init__(self):
         self.status = "Waiting"
-        self.worker = self.tls = self.difficulty = "—"
+        self.worker = self.transport = self.difficulty = "—"
         self.slot = None
         self.last = 0
         self.models = [ModelStats() for _ in SLOTS]
@@ -81,8 +81,10 @@ class Session:
         message = None
         if name == "start":
             self.worker = r.get("worker") or "unnamed"
+        elif name == "tcp_connected":
+            self.status, self.transport = "Connected", "TCP"
         elif name == "tls_connected":
-            self.status, self.tls = "Connected", r.get("tls", "TLS")
+            self.status, self.transport = "Connected", r.get("tls", "TLS")
         elif name == "authorized":
             self.status, message = "Authorized", "Pool login accepted"
         elif name == "job" and model:
@@ -191,7 +193,7 @@ def draw(screen, s, gpu, colors, now):
         put(y, 1, line, green)
     put(1, 23, "METAL  /  NEB", curses.A_BOLD)
     put(2, 23, s.worker, dim, width-42)
-    put(3, 23, f"● {status}  ·  {s.tls}", alert if stale else green)
+    put(3, 23, f"● {status}  ·  {s.transport}", alert if stale else green)
     if s.last:
         stamp = datetime.fromtimestamp(s.last).strftime("%H:%M:%S")
         put(4, 23, f"Last event {stamp}  ·  {max(0, int(now-s.last))}s ago", dim)
