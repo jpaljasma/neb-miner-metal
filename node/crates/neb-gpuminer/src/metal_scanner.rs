@@ -18,6 +18,9 @@ mod metal_indices;
 pub use metal_ahead::TessAhead;
 #[path = "metal_screen.rs"]
 mod metal_screen;
+#[cfg(feature = "metal-bench")]
+#[path = "metal_turnover_bench.rs"]
+mod metal_turnover_bench;
 pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, ScreenResult};
 #[cfg(feature = "metal-bench")]
 pub struct PairScreenVariant {
@@ -32,6 +35,8 @@ const DISPATCH: usize = 2048;
 const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 const ROW: usize = 3634;
 const STRIDE: usize = ROW.next_multiple_of(4);
+// Support words by layer: 1,360 convolution weights, then 32×768 and 2×32 dense weights.
+const SUPPORT_WORDS: usize = 1360usize.div_ceil(32) + 32 * 24 + 2;
 const SHADER: &str = include_str!("../../../../pow/gpu/kep1.metal");
 // Exact short-vector products, closed-form zero salt and 256 threads per nonce.
 const DEFAULT_VARIANT: u8 = 4 | 8 | 16;
@@ -41,6 +46,22 @@ fn pipeline(device: &Device, mask: u8) -> Result<(ComputePipelineState, u64), St
 }
 
 fn table_pipeline(device: &Device, mask: u8, build: u8, read: u8) -> Result<(ComputePipelineState, u64), String> {
+    table_pipeline_options(device, mask, build, read, PairBuilder::General)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairBuilder {
+    General,
+    TwoRows,
+    MaskedTwoRows,
+}
+
+fn table_pipeline_options(
+    device: &Device,
+    mask: u8,
+    build: u8,
+    read: u8,
+    pair_style: PairBuilder,
+) -> Result<(ComputePipelineState, u64), String> {
     let width = if mask & 16 == 0 { 128 } else { 256 };
     let source = format!(
         "#define ROW_CACHE {}\n#define PLANAR {}\n#define SHORT_MAC {}\n#define SALT_BASE {}\n#define SINGLE_CACHE {}\n#define COMPACT_ROWS {}\n#define SHORT_DOT {}\n#define COMBO_BUILD {build}\n#define COMBO_READ {read}\n#define GROUP_WIDTH {width}\n{SHADER}",
@@ -58,6 +79,12 @@ fn table_pipeline(device: &Device, mask: u8, build: u8, read: u8) -> Result<(Com
     } else {
         source
     };
+    let source = format!(
+        "#define TWO_ROW {}\n#define PAIR_OUTPUT_MASK {}\n{}",
+        u8::from(pair_style != PairBuilder::General),
+        u8::from(pair_style == PairBuilder::MaskedTwoRows),
+        source
+    );
     let library = device.new_library_with_source(&source, &CompileOptions::new())?;
     let function = library.get_function("kep1_digest", None)?;
     let state = device.new_compute_pipeline_state_with_function(&function)?;
@@ -103,12 +130,68 @@ struct ModelRows {
     combos: Option<Combos>,
 }
 
+// Lay out each layer on a word boundary. The two dense layers have 768 and 32 inputs.
+fn turnover_tables(
+    device: &Device,
+    rows: &ModelRows,
+    ids: &[u32],
+    masks: bool,
+    triples: bool,
+) -> Result<(Option<Buffer>, Option<Buffer>), String> {
+    if !masks && !triples {
+        return Ok((None, None));
+    }
+    let active = masks.then(|| shared_buffer(device, rows.live.len() * 4)).transpose()?;
+    let support = triples.then(|| shared_buffer(device, ids.len().max(1) * SUPPORT_WORDS * 4)).transpose()?;
+    // SAFETY: each buffer is exclusive here, zeroed by Metal and sized by its respective index domain.
+    let mut outputs =
+        active.as_ref().map(|b| unsafe { std::slice::from_raw_parts_mut(b.contents().cast::<u32>(), rows.live.len()) });
+    let mut bits = support.as_ref().map(|b| {
+        // SAFETY: this new mapping has SUPPORT_WORDS aligned words per live rank and has not been submitted.
+        unsafe { std::slice::from_raw_parts_mut(b.contents().cast::<u32>(), ids.len() * SUPPORT_WORDS) }
+    });
+    // SAFETY: the padded row buffer has this fixed stride and all previous commands completed.
+    let packed = unsafe { std::slice::from_raw_parts(rows.buffer.contents().cast::<u8>(), rows.live.len() * STRIDE) };
+    for (rank, &sample) in ids.iter().enumerate() {
+        let row = &packed[sample as usize * STRIDE..][..ROW];
+        let factors = &row[2800..];
+        if let Some(out) = outputs.as_mut() {
+            out[sample as usize] = factors[..32].iter().enumerate().fold(0, |m, (i, &x)| m | (u32::from(x != 0) << i));
+        }
+        if let Some(bits) = bits.as_mut() {
+            let dest = &mut bits[SUPPORT_WORDS * rank..][..SUPPORT_WORDS];
+            let wide = row[..160].as_chunks::<4>().0.iter().map(|g| *g != [0; 4]);
+            let narrow = row[160..2800].as_chunks::<2>().0.iter().map(|g| *g != [0; 2]);
+            for (i, nonzero) in wide.chain(narrow).enumerate() {
+                if nonzero {
+                    dest[i / 32] |= 1 << (i % 32);
+                }
+            }
+            for (base, errors, inputs) in
+                [(43, &factors[..32], &factors[32..800]), (811, &factors[800..802], &factors[802..834])]
+            {
+                for (w, chunk) in inputs.as_chunks::<32>().0.iter().enumerate() {
+                    let mask = chunk.iter().enumerate().fold(0, |m, (i, &v)| m | (u32::from(v != 0) << i));
+                    for (o, &error) in errors.iter().enumerate() {
+                        if error != 0 {
+                            dest[base + o * (inputs.len() / 32) + w] = mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((active, support))
+}
+
 struct Combos {
     rank_buffers: [Option<Buffer>; 3],
     values: Buffer,
     args: [u32; 3], // ready pairs, ready triple prefix, allocated pairs
     ids: Buffer,
     pair_builder: ComputePipelineState,
+    active_outputs: Option<Buffer>,
+    support: Option<Buffer>,
     host_ranks: Vec<u32>,
     last_slice: std::time::Instant,
     slice_delay: std::time::Duration,
@@ -147,6 +230,9 @@ impl Combos {
             let cmd = queue.new_command_buffer();
             let e = cmd.new_compute_command_encoder();
             e.set_compute_pipeline_state(pipeline);
+            if let Some(active) = &self.active_outputs {
+                e.set_buffer(10, Some(active), 0);
+            }
             e.set_buffer(0, Some(rows), 0);
             e.set_buffer(1, Some(&self.ids), 0);
             e.set_buffer(2, Some(&self.values), ((offset + first) * 32) as u64);
@@ -223,6 +309,13 @@ fn finish_tickets(platform: blake3::platform::Platform, keys: &mut [[u8; 32]], d
 }
 
 pub struct MetalScanner {
+    recover_triples: bool,
+    skip_unchanged: bool,
+    pair_style: PairBuilder,
+    #[cfg(feature = "metal-bench")]
+    skipped_bytes: usize,
+    #[cfg(feature = "metal-bench")]
+    copy_seconds: f64,
     device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
@@ -253,6 +346,9 @@ impl MetalScanner {
     pub fn for_slot(dataset: SharedDataset, slot: usize) -> Result<Self, String> {
         let mut scanner = Self::open(dataset)?;
         scanner.compact_tickets = slot == 1;
+        if slot == 1 {
+            scanner.pair_style = PairBuilder::TwoRows;
+        }
         Ok(scanner)
     }
     /// Compare lookup construction and upload, including the destination allocation.
@@ -279,6 +375,13 @@ impl MetalScanner {
         let queue = device.new_command_queue();
         Ok(Self {
             device,
+            recover_triples: false,
+            skip_unchanged: false,
+            pair_style: PairBuilder::MaskedTwoRows,
+            #[cfg(feature = "metal-bench")]
+            skipped_bytes: 0,
+            #[cfg(feature = "metal-bench")]
+            copy_seconds: 0.,
             queue,
             pipeline,
             width,
@@ -582,7 +685,6 @@ impl MetalScanner {
         self.retry_screen = Some(retry);
         Ok(())
     }
-    #[allow(clippy::too_many_arguments)]
     pub fn screen_range(
         &mut self,
         header: &[u8; 80],
@@ -592,10 +694,37 @@ impl MetalScanner {
         arity: u8,
         check: bool,
     ) -> Result<ScreenResult, String> {
-        if self.screen.is_none() {
-            self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets, self.dataset.n())?);
-        }
-        self.screen.as_mut().unwrap().scan(
+        self.run_screen(header, start, count, bound, arity, check, false)
+    }
+
+    fn productive_range(
+        &mut self,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        bound: &[u8; 32],
+    ) -> Result<ScreenResult, String> {
+        self.run_screen(header, start, count, bound, 2, false, self.recover_triples)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_screen(
+        &mut self,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        bound: &[u8; 32],
+        arity: u8,
+        check: bool,
+        recover: bool,
+    ) -> Result<ScreenResult, String> {
+        let screen = match &mut self.screen {
+            Some(screen) => screen,
+            empty @ None => {
+                empty.insert(metal_screen::Screen::new(&self.device, self.compact_tickets, self.dataset.n())?)
+            }
+        };
+        screen.scan(
             &self.queue,
             self.rows.as_mut().ok_or("missing model")?,
             self.dataset.n(),
@@ -605,6 +734,7 @@ impl MetalScanner {
             bound,
             arity,
             check,
+            recover,
         )
     }
     pub fn combo_pipeline(&self, arity: u8) -> Result<(ComputePipelineState, u64), String> {
@@ -649,12 +779,22 @@ impl MetalScanner {
         let values = shared_buffer(&self.device, bytes.max(32))?;
         let reuse = self.reuse_hint.take();
         let build_kind = if reuse.is_some() { 4 } else { 2 };
-        let (pair_builder, _) = table_pipeline(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0)?;
+        let (pair_builder, _) =
+            table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0, self.pair_style)?;
+        let (active_outputs, support) = turnover_tables(
+            &self.device,
+            rows,
+            ids,
+            self.pair_style == PairBuilder::MaskedTwoRows,
+            self.recover_triples,
+        )?;
         rows.combos = Some(Combos {
             rank_buffers,
             values,
             ids: live_ids,
             pair_builder,
+            active_outputs,
+            support,
             host_ranks: rank,
             args: [0, 0, pairs as u32],
             last_slice: std::time::Instant::now(),
@@ -669,11 +809,12 @@ impl MetalScanner {
             if count == 0 {
                 continue;
             }
-            let (p, _) = table_pipeline(
+            let (p, _) = table_pipeline_options(
                 &self.device,
                 DEFAULT_VARIANT | 64 | 128,
                 if arity == 2 { build_kind } else { arity },
                 0,
+                if arity == 2 { self.pair_style } else { PairBuilder::General },
             )?;
             let start = std::time::Instant::now();
             for first in (0..count).step_by(32768) {
@@ -794,7 +935,7 @@ impl Scanner for MetalScanner {
         if self.screen_batches.is_multiple_of(512 / SCREEN_BATCH_SCALE) {
             self.audit_screen(model, header, start, count.min(16))?;
         }
-        let result = self.screen_range(header, start, count, bound, 2, false)?;
+        let result = self.productive_range(header, start, count, bound)?;
         Ok((result.hits, result.evaluated))
     }
     fn capacity(&self) -> u32 {
@@ -825,8 +966,7 @@ impl Scanner for MetalScanner {
         }
         let threads = self.build_threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         let table = Table::build(model, &*self.dataset, threads, vec![])?;
-        #[cfg(not(feature = "metal-bench"))]
-        {
+        if !cfg!(feature = "metal-bench") || self.allow_screen {
             // The trained fixtures were 65–77% idle. Use the compact scanner
             // only on sparse models; dense jobs keep the full-width kernel.
             let compact = table.idle_rows() * 2 >= self.dataset.n() as usize;
@@ -863,10 +1003,10 @@ impl Scanner for MetalScanner {
         // buffer. All dispatches complete synchronously under exclusive access.
         let out = unsafe { std::slice::from_raw_parts_mut(rows.buffer.contents().cast::<u8>(), len) };
         self.reuse_hint = None;
+        let mut remap = Vec::new();
         if self.allow_reuse
             && let Some(old) = &rows.combos
         {
-            let mut remap = Vec::new();
             let mut same = 0;
             for (i, (dst, src)) in out.as_chunks::<STRIDE>().0.iter().zip(table.as_chunks::<ROW>().0).enumerate() {
                 if live.get(i) == Some(&true) {
@@ -887,10 +1027,28 @@ impl Scanner for MetalScanner {
                 self.reuse_hint = Some(PairReuse { ranks, old_values: old.values.clone(), ready: old.args[0] });
             }
         }
-        for (dst, src) in out.as_chunks_mut::<STRIDE>().0.iter_mut().zip(table.as_chunks::<ROW>().0) {
+        let mut prior = remap.into_iter();
+        #[cfg(feature = "metal-bench")]
+        let copy_start = std::time::Instant::now();
+        #[cfg(feature = "metal-bench")]
+        {
+            self.skipped_bytes = 0;
+        }
+        for (i, (dst, src)) in out.as_chunks_mut::<STRIDE>().0.iter_mut().zip(table.as_chunks::<ROW>().0).enumerate() {
+            if self.skip_unchanged && live.get(i) == Some(&true) && prior.next().is_some_and(|r| r != u32::MAX) {
+                #[cfg(feature = "metal-bench")]
+                {
+                    self.skipped_bytes += ROW;
+                }
+                continue;
+            }
             dst[..ROW].copy_from_slice(src);
         }
         rows.weights.clear();
+        #[cfg(feature = "metal-bench")]
+        {
+            self.copy_seconds = copy_start.elapsed().as_secs_f64();
+        }
         rows.weights.extend_from_slice(model.weights());
         rows.singles = singles;
         rows.live = live;

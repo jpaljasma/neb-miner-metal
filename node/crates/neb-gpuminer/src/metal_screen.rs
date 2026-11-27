@@ -124,6 +124,8 @@ fn prepare_header(args: &mut ScreenArgs, header: &[u8; 76], columns: bool) {
 }
 pub struct Screen {
     pair: ComputePipelineState,
+    recovered: Option<ComputePipelineState>,
+    compact_tickets: bool,
     tuning: PairTuning,
     reference_tuning: PairTuning,
     general: Option<ComputePipelineState>,
@@ -154,11 +156,21 @@ impl Screen {
         mask: u8,
         tuning: PairTuning,
     ) -> Result<ComputePipelineState, String> {
+        Self::compile(device, check, mask, tuning, false)
+    }
+    fn compile(
+        device: &metal::DeviceRef,
+        check: bool,
+        mask: u8,
+        tuning: PairTuning,
+        recover: bool,
+    ) -> Result<ComputePipelineState, String> {
         let src = format!(
             concat!(
                 "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n",
                 "#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n",
-                "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n#define RANK_LAYOUT {}\n{}",
+                "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n",
+                "#define RANK_LAYOUT {}\n#define RECOVER_THREE {}\n#define SUPPORT_WORDS {}\n{}",
             ),
             u8::from(check),
             u8::from(mask & SCALAR_CHACHA != 0),
@@ -170,6 +182,8 @@ impl Screen {
             u8::from(mask & COMPACT_TICKETS != 0),
             tuning.threads,
             tuning.ranks as u8,
+            u8::from(recover),
+            SUPPORT_WORDS,
             include_str!("../../../../pow/gpu/kep1_screen.metal")
         );
         let lib = device.new_library_with_source(&src, &CompileOptions::new())?;
@@ -183,6 +197,7 @@ impl Screen {
     #[cfg(feature = "metal-bench")]
     pub(super) fn set_pair_pipeline(&mut self, p: ComputePipelineState, mode: u8, tuning: PairTuning) {
         self.pair = p;
+        self.recovered = None;
         self.mode = mode;
         self.tuning = tuning;
     }
@@ -192,6 +207,8 @@ impl Screen {
         let reference_tuning = PairTuning { ranks: tuning.ranks, ..Default::default() };
         Ok(Self {
             pair: Self::tuned_variant(device, false, mode, tuning)?,
+            recovered: None,
+            compact_tickets,
             tuning,
             reference_tuning,
             general: None,
@@ -218,6 +235,7 @@ impl Screen {
         bound: &[u8; 32],
         arity: u8,
         check: bool,
+        recover: bool,
     ) -> Result<ScreenResult, String> {
         if count == 0
             || count > MINING_SCREEN_CAP
@@ -228,7 +246,21 @@ impl Screen {
         }
         let tables = rows.combos.as_mut().ok_or("combination tables unavailable")?;
         let single = rows.singles.as_ref().ok_or("single table unavailable")?;
-        let pipeline = if check {
+        if recover && (check || arity != 2 || tables.support.is_none()) {
+            return Err("missing exact three-row support".into());
+        }
+        let pipeline = if recover {
+            match &mut self.recovered {
+                Some(p) => p,
+                empty @ None => empty.insert(Self::compile(
+                    queue.device(),
+                    false,
+                    pair_mode(self.compact_tickets),
+                    self.tuning,
+                    true,
+                )?),
+            }
+        } else if check {
             &self.check
         } else if arity <= 2 {
             &self.pair
@@ -282,6 +314,9 @@ impl Screen {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(pipeline);
+            if recover {
+                enc.set_buffer(8, tables.support.as_deref(), 0);
+            }
             if let Some(buffer) = mapped {
                 enc.set_buffer(0, Some(buffer), 0);
             } else {

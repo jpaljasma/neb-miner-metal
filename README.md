@@ -17,6 +17,8 @@ Our miner builds a lookup table before scanning. That took 306 ms for Kepler and
 
 In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s** and TESS averaged **93.30 MH/s**. Each rate counts completed tickets over the time the pool assigned that model, including setup. Suprnova accepted 59 of 59 Kepler shares and 19 of 20 TESS shares. One TESS share went stale at a job change. [Pool tests and tuning](docs/metal-pool-tuning.md)
 
+When the model changes, a dedicated two-row Metal kernel builds the pair lookup table. On a held-out Kepler model it cut table construction from **5.07 s to 2.48 s**. [Model-turnover benchmarks](docs/metal-turnover.md)
+
 ![NEB terminal dashboard with Kepler mining, the last TESS job, and recent pool replies](docs/images/metal-miner-dashboard.png)
 
 ## Try it on your Mac
@@ -34,7 +36,7 @@ node/target/release/neb-miner-metal --dataset build/neb-datasets.bin --benchmark
 
 ## Mine with Suprnova
 
-With Python 3 installed, save your NEB payout address in `.neb-payout-address` and your Suprnova TLS pool URL in `.neb-pool-url`, each on one line in the repository root. Git ignores both files. [Suprnova pool setup](https://neb.suprnova.cc/StartMining.html)
+With Python 3 installed, save your NEB payout address in `.neb-payout-address` and your Suprnova pool URL in `.neb-pool-url`, each on one line in the repository root. Use `stratum+tcp://` for plain TCP or `stratum+ssl://` for TLS, with the corresponding port from the pool guide. Git ignores both files. [Suprnova pool setup](https://neb.suprnova.cc/StartMining.html)
 
 ```sh
 ./start-neb.command

@@ -6,6 +6,12 @@ from metal_tui import Session, draw, read_events
 
 
 class Dashboard(unittest.TestCase):
+    def test_shows_selected_pool_transport(self):
+        state = Session()
+        for event, details, expected in (("tcp_connected", {}, "TCP"), ("tls_connected", {"tls": "TLSv1.3"}, "TLSv1.3")):
+            state.update(dict(event=event, utc="2026-11-27T12:00:00+00:00", **details))
+            self.assertEqual(state.transport, expected)
+
     def test_slot_rate_peak_and_replies_stay_with_original_model(self):
         s=Session()
         def add(event,**kw):

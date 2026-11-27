@@ -1,0 +1,95 @@
+# M1 Max model-turnover replay
+
+The baseline is the merged miner with tagged rank lookups and 4,194,304 nonces per selective dispatch. All measurements below use completed tickets. Each GPU replay ran alone on the 32-core M1 Max with 64 GB of unified memory. [Baseline revision](https://github.com/jpaljasma/neb-miner-metal/commit/73b45007291ede3d5f9680cb791a6eab522da2e8)
+
+## What changed in each arm
+
+| Factor | Enabled behavior |
+| --- | --- |
+| A · exact triples | Consider a nonce with exactly three live samples. Check that all three pair entries are ready and that no weight has a nonzero gradient in all three samples. Reconstruct its digest from the pair, single and empty digests. |
+| B · two-row builder | Build a pair using two signed byte factors per element in threadgroup memory. Use the union of the rows' precomputed dense-output masks to visit the outputs that can contribute. A separate crossover also tests the two-row builder without the mask. |
+| C · skip unchanged writes | On a model change, reuse the byte comparison already performed for pair remapping. A live row with identical packed bytes stays in its existing shared buffer. Changed rows get the full copy. |
+
+The eight arms toggle A, B and C independently. Mask values are 1, 2 and 4. The control has mask 0. All arms retain the baseline's pair reuse and CPU share verification.
+
+## Which triples can be recovered?
+
+Let D(X) be the eight 32-bit digest lanes of the summed gradients in X. When at least one of a, b or c contributes zero at every weight, the following identity holds lane by lane modulo 2³², including after clipping and XOR with the weight salt.
+
+```text
+D(abc) = D(ab) + D(ac) + D(bc) - D(a) - D(b) - D(c) + D(empty)
+```
+
+The support mask comes from the actual packed convolution gradients and dense-layer factors. The CPU coverage test independently obtains its masks from the reference sample-gradient function. In one million uniformly drawn live triples per model, sampled with replacement, Kepler yielded 937, 468, 982 and 6,430 recoverable cases on four snapshots. TESS yielded zero in the four samples. These rates are conditional on drawing exactly three live rows. A zero sample count does not prove the model has no recoverable triples.
+
+## All eight combinations on the fixed holdout
+
+Each run loaded a predecessor and warmed its pair table before transitioning to different weights. Setup includes the new model and complete pair table. Scan rates are medians over 32 fixed ranges of 8,388,608 nonces after setup. Within each slot, all eight full pair tables had the same byte hash. Candidates in the timing runs were CPU-checked.
+
+| Enabled | Kepler setup (s) | Kepler scan (MH/s) | TESS setup (s) | TESS scan (MH/s) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 5.396 | 13.60 | 0.652 | 480.86 |
+| A | 5.370 | 6.34 | 0.656 | 298.71 |
+| B | 2.789 | 13.46 | 0.440 | 471.26 |
+| A+B | 2.799 | 6.50 | 0.421 | 288.34 |
+| C | 5.435 | 13.56 | 0.657 | 484.36 |
+| A+C | 5.452 | 6.47 | 0.636 | 303.80 |
+| B+C | 2.760 | 12.98 | 0.412 | 464.93 |
+| A+B+C | 2.844 | 6.35 | 0.408 | 307.34 |
+
+The triple path added 39,265 exact Kepler tickets across the 32 holdout ranges. Its extra classification and support reads took more time than those tickets repaid. B and C affect setup. Their scan-only differences include variation between runs of the same pair screen.
+
+## First tickets after a model change
+
+Each arm also started from a prepared predecessor on an adjacent-weight transition. The clock started before loading the new weights. It included the adaptive selector, building pairs between scans, scanner audits and CPU verification of returned hits. At each deadline the outstanding batch finished and the rate used its observed elapsed time. Each cell below is one timed transition; the small differences between nearby arms need separate paired confirmation.
+
+| Enabled | Kepler first 5 s | First 15 s | First 30 s | TESS first 5 s | First 15 s | First 30 s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 20.33 | 43.82 | 55.40 | 186.07 | 236.64 | 250.19 |
+| A | 10.80 | 19.20 | 23.34 | 135.20 | 165.17 | 172.08 |
+| B | 29.08 | 53.20 | 59.42 | 214.78 | 246.18 | 253.35 |
+| A+B | 14.02 | 23.22 | 25.72 | 148.55 | 167.01 | 173.97 |
+| C | 19.50 | 41.37 | 54.18 | 191.01 | 239.57 | 248.05 |
+| A+C | 11.22 | 19.21 | 23.63 | 127.67 | 163.22 | 170.58 |
+| B+C | 25.09 | 49.16 | 55.53 | 203.73 | 239.29 | 244.42 |
+| A+B+C | 14.20 | 22.07 | 25.15 | 153.33 | 170.14 | 175.42 |
+
+Units are millions of completed tickets per second. Both slots selected the lookup screen in these runs. Pool acknowledgements and the outer work-service audit are covered separately in a real pooled run.
+
+## Which parts of the builder helped?
+
+We compared the general builder, the two-row builder and the two-row builder with a precomputed dense-output mask on 48 order-balanced slices per snapshot and slot. Each arm wrote the same 65,536 pair entries per slice. The entire output slice was byte-hashed outside the timer. Metal reported 13,600 bytes of static threadgroup storage for the general builder and 1,936 bytes for both specialized builders.
+
+| Paired gain in builder throughput | Adjacent Kepler | Holdout Kepler | Adjacent TESS | Holdout TESS |
+| --- | ---: | ---: | ---: | ---: |
+| Masked two-row builder over general | +96.64% | +106.03% | +89.29% | +88.82% |
+| Adding the mask to the two-row builder | +2.47% | +4.19% | −1.57% | −1.91% |
+
+The 90% paired bootstrap intervals for the incremental mask effect were +1.21% to +3.83% and +3.70% to +4.67% on Kepler. On TESS they were −1.86% to −1.27% and −2.15% to −1.67%. The selected Kepler builder uses the mask. The selected TESS builder checks its two error values directly.
+
+Skipping confirmed identical rows eliminated 7.84 MiB of writes per adjacent Kepler transition and 1.38 MiB on TESS. The more distant transition had no reusable rows on either slot. In 20 paired adjacent refreshes with byte-hashed mapped output, the estimated change in complete model-preparation speed with C was −0.63% on Kepler (90% interval −3.11% to +1.89%) and −2.76% on TESS (−6.68% to +1.16%). Skipped bytes alone did not establish a throughput gain.
+
+On the reverse transition, six order-balanced five-second trials per slot compared the baseline, the selected builder and the builder plus skipped writes. The selected builder improved completed tickets per second by **39.06% on Kepler** (90% paired interval +35.86% to +42.22%) and **15.75% on TESS** (+14.33% to +17.25%). Adding skipped writes changed those rates by −0.82% (−3.00% to +1.06%) and −0.34% (−1.35% to +0.58%). Production enables B alone. A and C remain benchmark options.
+
+The CPU oracle covers 131,072 nonces through the end of the nonce range on each checked model. It verifies full and restricted pair-table prefixes, eligible counts, hit sets and exact-target comparisons. A targeted search also located and checked 335 newly admitted Kepler tickets and three rare TESS tickets against the reference, including targets one below each reference ticket. A separate folding test covers repeated values, zero contributions, signed clipping boundaries and modulo-32-bit arithmetic.
+
+## Reproduce the replay
+
+Build the `metal_turnover` Cargo example in release mode with the `metal-bench` feature. Use the pinned mainnet dataset, two distinct same-slot model snapshots in the format produced by `tools/capture_metal_models.py`, and an otherwise idle GPU. Generate the independent CPU oracle for the destination model before timing any GPU arm.
+
+```sh
+cargo build --release --locked --manifest-path node/Cargo.toml -p neb-gpuminer --features metal-bench --example metal_turnover
+bench=node/target/release/examples/metal_turnover
+dataset=build/neb-datasets.bin
+"$bench" support "$dataset" "$old" "$new"
+for slot in 0 1; do
+    oracle="build/turnover-oracle-$slot.bin"
+    "$bench" oracle "$dataset" "$new" "$slot" "$oracle"
+    for mask in 0 1 2 3 4 5 6 7; do
+        "$bench" fixed "$dataset" "$old" "$new" "$slot" "$mask" 1 37 "$oracle"
+        "$bench" window "$dataset" "$old" "$new" "$slot" "$mask" 1 71 "$oracle"
+    done
+done
+```
+
+Set `old` and `new` to your snapshot directories. The argument after the mask toggles the precomputed dense-output mask for B. The following integer seeds the replay headers. Repeat with different weights for holdout testing and rotate arm order when recording timings. The `builders`, `copy`, `extra` and `paired-short` modes use the same argument order for component and five-second confirmation runs.
