@@ -67,3 +67,14 @@ cp node/crates/neb-gpuminer/examples/metal_refresh.rs "$PR2_DIR/node/crates/neb-
 cargo run --manifest-path "$PR2_DIR/node/Cargo.toml" --release --locked -p neb-metalminer \
   --example metal_refresh -- "$PWD/build/neb-datasets.bin"
 ```
+
+## Matched Metal scan on November 27, 2026
+
+The comparison above was repeated with the newer miner. Both release builds ran the same `metal_refresh` example on the same 32-core M1 Max with 64 GB of unified memory. The pool worker was paused. Each engine scanned all 8,192 nonces at the end of the 32-bit range in two batches of 4,096, using the same mainnet genesis weights and headers. The table gives the median of five scans after one warm-up. Both engines matched the pinned hash of the complete ordered ticket stream on every pass. [neb-miner-metal revision](https://github.com/jpaljasma/neb-miner-metal/commit/7a1c2bdb47c5b108118f366b02a0bdbc3aa0a914) · [pramonoutomo revision](https://github.com/pramonoutomo/neb/tree/52af7b84d897659359f4426e49f0c0efcfbdbb17/node/crates/neb-metalminer)
+
+| Model | neb-miner-metal tickets/s | Peer tickets/s | Scan speedup | neb-miner-metal model setup | Peer model setup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kepler | 695,146 | 4,737 | 146.7× | 305.565 ms | 0.003 ms |
+| TESS | 676,496 | 4,989 | 135.6× | 164.195 ms | 0.003 ms |
+
+Model setup times the first call to `set_weights` after engine construction. The speedup compares subsequent exhaustive scans. The live pool measurements in the README use selective mining on trained models and include job turnover.
