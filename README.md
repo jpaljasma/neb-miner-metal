@@ -23,6 +23,8 @@ The offline columns are medians over 24 timed blocks on two fixed, trained model
 
 Selective mining adds the largest gain on sparse models. The GPU computes exact tickets from cached digests for zero, one or two nonzero sample gradients. It builds the pair table in slices so mining can continue during setup. Reusing valid pairs across Kepler model changes cut median setup from **3.79 s to 3.05 s** in 12 paired trials. The miner can choose exhaustive scanning when the expected gain would take too long to repay setup. [Tuning measurements and replay commands](docs/metal-pool-tuning.md)
 
+Increasing selective dispatches to 1,048,576 nonces raised prepared-table throughput from **25.91 to 43.20 M tickets/s on Kepler** and **102.34 to 162.93 M tickets/s on TESS**. A further pair-only kernel gained 1.80% on Kepler and 0.39% on TESS in a holdout replay. It remains experimental because the lower confidence bounds fell below the 1.5% promotion threshold. [Dispatch and kernel experiments](docs/metal-pool-tuning.md#selective-dispatch-size-on-m1-max)
+
 On the original fixed genesis jobs, the first Metal release ran **2.04× as fast on Kepler and 2.01× on TESS** as the optimized 10-thread CPU miner. All 16,384 tickets matched the CPU reference byte for byte. [CPU comparison and methodology](docs/metal-benchmark.md)
 
 ## Build and run on macOS
@@ -46,13 +48,17 @@ node/target/release/neb-miner-metal --dataset build/neb-datasets.bin --node 127.
 
 For a timed session with a named worker, reconnect handling, local event logs and the adaptive GPU screen, see [M1 Max pool operation and measured optimizations](docs/metal-pool-tuning.md).
 
+To watch an existing pool session, run `python3 tools/metal_tui.py` from the repository root or pass the path to its JSONL log. The dashboard gives Kepler and TESS their own panels. Each shows the last measured rate, average over active compute time, peak, completed tickets, job difficulty and share replies. A late rejection counts against the model that submitted the share. The active panel is marked **ACTIVE**. GPU utilization and memory in the header cover the whole device. Press **q** to close the viewer while mining continues.
+
+On macOS, `./start-neb.command` opens the 24-hour selective miner and its dashboard in separate Terminal windows. Put the TLS pool URL in the ignored `.neb-pool-url` file beside your local payout address. Both windows use the same session log, and launching again attaches to an existing logged session for that pool.
+
 Save your own public NEB payout address on one line in `.neb-payout-address` at the repository root. Git ignores this file. Set `POOL_URL` to your Suprnova NEB TLS endpoint, then run:
 
 ```sh
 python3 tools/test_metal_stratum.py --pool "$POOL_URL"
 ```
 
-The Python 3 adapter connects with certificate and hostname verification, starts the release Metal executable on a temporary loopback work service, and submits its CPU-checked candidate under your payout login. It requests a fixed difficulty of one million attempts per share, subject to the pool's limits. The test exits after the first pool acceptance or a 120-second timeout and shuts down the child. An acceptance confirms submitted work. Account credit and payout follow the pool's accounting rules. [Suprnova's NEB Stratum specification](https://neb.suprnova.cc/CoinInfos.html#stratum)
+The Python 3 adapter connects with certificate and hostname verification, starts the release Metal executable on a temporary loopback work service, and submits its CPU-checked candidate under your payout login. It sends a legacy difficulty hint in the password and follows the pool's actual `mining.set_difficulty` notifications. Suprnova's current setup guide documents VarDiff and `mining.suggest_difficulty` for choosing a starting difficulty. The one-share test exits after a pool acceptance or a 120-second timeout and shuts down the child. Account credit and payout follow the pool's accounting rules. [Suprnova setup guide](https://neb.suprnova.cc/StartMining.html)
 
 ### How the Metal engine works
 
