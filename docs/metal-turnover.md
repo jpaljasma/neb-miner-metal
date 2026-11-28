@@ -137,4 +137,21 @@ The complete pair tables matched byte for byte. Kepler construction went from 1.
 
 We also tried combining rank checks in groups of eight or sixteen and using the already-ordered ranks to simplify triangular indexing. The best scan-only candidate gained 0.62% in the initial screen and lost 1.14% on the holdout. The production scan retains the four-sample early exit.
 
-Use the `geometry` replay mode with slot 0, mask 2 and the masked builder to compare the nine pair kernels. IDs 0–2 use 256 threads, 3–5 use 128, and 6–8 use 64. Within each width, the order is staged, direct, then input-first. Use `direct-fixed` to verify the full table and `paired-direct` to compare first-five-second work in alternating order.
+Use the `geometry` replay mode with slot 0, mask 2 and the masked builder to compare pair kernels. The original nine configurations occupy IDs 0–8. IDs 0–2 use 256 threads, 3–5 use 128, and 6–8 use 64. Within each width, the order is staged, direct, then input-first. Use `direct-fixed` to verify the full table and `paired-direct` to compare first-five-second work in alternating order.
+
+## One SIMD group per pair
+
+The M1 Max pair builder now assigns 32 threads to a pair. One SIMD group can write the eight digest words directly after two shuffle operations. This removes the shared partial sums and the barrier that combined them. Kepler reads its factors from the existing row buffer. TESS still stages the factors in threadgroup memory. The Metal compiler knows the group width when compiling the two-row loops.
+
+In the dense layer, each factor lies in −8…7. The sum of two products lies in −112…128, inside the consensus clip of −256…256. The pair kernel folds that sum directly. Convolution gradients still use the full clip. Each lane handles two of the final layer’s 64 weights.
+
+An eight-way comparison crossed group width, compile-time loop width and removal of the dense clamp. On each of two recorded models per slot, all eight configurations built the same 65,536 pairs in each of 24 blocks. Run order rotated and reversed across blocks. Every digest slice had the same hash across configurations. The intervals are 90% paired bootstrap intervals for the geometric mean throughput ratio. [Baseline revision](https://github.com/jpaljasma/neb-miner-metal/commit/38c47e7)
+
+| Model | Pair throughput, first fixture | Pair throughput, holdout | Static threadgroup memory | Full holdout table, baseline → new |
+| --- | ---: | ---: | ---: | ---: |
+| Kepler | +6.14% (+3.88 to +8.41%) | +10.22% (+8.76 to +11.63%) | 64 → 0 bytes | 1.653 → 1.541 s |
+| TESS | +12.58% (+11.95 to +13.20%) | +12.49% (+11.83 to +13.18%) | 1,936 → 1,680 bytes | 0.270 → 0.239 s |
+
+Both complete tables on both slots matched the baseline hash. On each of the four jobs the replay also checked full and restricted pair-table prefixes against the CPU oracle. To reproduce the full-table comparison, build `metal_turnover` on the baseline and on this revision. At each revision run `direct-fixed` with slot 0 and arguments `2 1`, or `fixed` with slot 1 and arguments `2 0`, followed by the same seed and oracle on each build. The `geometry` replay now includes 32-thread groups at IDs 9–11.
+
+The `cpu-feed` replay measured completed tickets in the first five seconds after switching weights, including foreground setup with ten CPU threads. Six matched comparisons per slot used three weight transitions, seeds 91–96 and alternating run order. Kepler gained **2.10%** (90% paired bootstrap interval +0.41% to +3.66%). TESS gained **1.06%** (+0.36% to +1.73%). These measurements apply to job startup. The steady-state nonce screening kernel is the same in both builds.

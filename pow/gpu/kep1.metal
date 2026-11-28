@@ -28,6 +28,15 @@ inline uint fold(int grad, uint layer, uint weight) {
     return uint(clamp(grad, -256, 256)) ^ (7919u * layer + weight);
 }
 
+#if TWO_ROW
+// Signed four-bit dense factors bound each product to [-56,64]. Two products
+// always fit within the consensus clip, so their sum can be folded directly.
+inline uint dense_pair_delta(short2 products, uint weight) {
+    uint salt = 7919u*5+weight;
+    return (uint(int(products.x)+products.y) ^ salt)-salt;
+}
+#endif
+
 inline uint triangular(uint n) { return n*(n+1)/2; }
 // Triple-prefix domains are bounded by the host before this multiplication.
 inline uint tetrahedral(uint n) { return n*(n+1)*(n+2)/6; }
@@ -57,7 +66,8 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
                         #endif
                         uint tid [[thread_index_in_threadgroup]],
                         uint group [[threadgroup_position_in_grid]],
-                        uint width [[threads_per_threadgroup]]) {
+                        uint dispatched_width [[threads_per_threadgroup]]) {
+    const uint width = TWO_ROW ? GROUP_WIDTH : dispatched_width;
     #if TWO_ROW && DIRECT_FACTORS
     #define PAIR(e) char2(as_type<char>(rows[OFFSET(0)+factor_offset+(e)]),as_type<char>(rows[OFFSET(1)+factor_offset+(e)]))
     #elif TWO_ROW
@@ -70,7 +80,6 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
     threadgroup Factors factors[factor_count];
     #define FACTOR(e,w) factors[e].v[w]
     #endif
-    threadgroup uint partial[GROUP_WIDTH/32][8];
     #if COMBO_BUILD
     uint combo = lookup_args[0] + group;
     uint component[3];
@@ -194,7 +203,7 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
         for(uint active=mask;active;active &= active-1){
             uint o=ctz(active), weight=o*768+q;
             short2 p=input*short2(PAIR(o));
-            sum+=fold(int(p.x)+p.y,5,weight)-(7919u*5+weight);
+            sum+=dense_pair_delta(p,weight);
         }
     }
     #else
@@ -210,13 +219,13 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
         for (uint q=tid;q<768;q+=width) {
             short2 p=short2(PAIR(o))*short2(PAIR(32+q));
             uint weight=o*768+q;
-            sum+=fold(int(p.x)+p.y,5,weight)-(7919u*5+weight);
+            sum+=dense_pair_delta(p,weight);
         }
     }
     #endif
-    if (tid<64) {
-        short2 p=short2(PAIR(800+tid/32))*short2(PAIR(802+tid%32));
-        sum+=fold(int(p.x)+p.y,6,tid);
+    for (uint i=tid;i<64;i+=width) {
+        short2 p=short2(PAIR(800+i/32))*short2(PAIR(802+i%32));
+        sum+=fold(int(p.x)+p.y,6,i);
     }
     #else
     for (uint o = 0; o < 32; o++) {
@@ -255,6 +264,10 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
     // digest lane, then combine the SIMD groups in the threadgroup.
     sum += simd_shuffle_xor(sum, 8);
     sum += simd_shuffle_xor(sum, 16);
+    #if GROUP_WIDTH == 32
+    if (tid < 8) digests[8*group+tid] = sum;
+    #else
+    threadgroup uint partial[GROUP_WIDTH/32][8];
     if ((tid % 32) < 8) partial[tid/32][tid%8] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < 8) {
@@ -262,4 +275,5 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
         for (uint i = 0; i < width/32; i++) total += partial[i][tid];
         digests[8*group+tid] = total;
     }
+    #endif
 }
