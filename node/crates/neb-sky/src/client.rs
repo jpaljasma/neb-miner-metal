@@ -1,9 +1,8 @@
 //! The miner side of the transport (`spec/sky-search.md` section 10): ask the batch server for a batch, run the
-//! search, post the result. Plain HTTP over the standard library; nothing secret travels and the server checks
-//! every result.
+//! search, post the result. Plain HTTP; nothing secret travels and the server checks
+//! every result. This port of the v1.0.11 client uses ureq for HTTP framing and
+//! counts service failures separately from an empty queue or a refused result.
 
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -50,7 +49,9 @@ pub enum Error {
     Url(String),
     /// The connection failed or the reply was cut.
     Io(std::io::Error),
-    /// The reply is not an HTTP reply.
+    /// The server returned an unexpected HTTP status.
+    Status(u16),
+    /// The server returned an invalid batch.
     Reply,
 }
 
@@ -59,7 +60,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::Url(u) => write!(f, "the sky server address must be http://host:port, got {u}"),
             Error::Io(e) => write!(f, "sky server: {e}"),
-            Error::Reply => f.write_str("the sky server sent a reply that is not HTTP"),
+            Error::Status(code) => write!(f, "sky server returned HTTP {code}"),
+            Error::Reply => f.write_str("the sky server sent an invalid batch"),
         }
     }
 }
@@ -97,30 +99,22 @@ fn encode(value: &str) -> String {
 }
 
 /// One request; the status code and the body of the reply.
-fn request(config: &Config, method: &str, route: &str, body: &[u8]) -> Result<(u16, Vec<u8>), Error> {
+fn request(agent: &ureq::Agent, config: &Config, route: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>), Error> {
     let (host, prefix) = split(&config.url)?;
-    let query = format!(
-        "software={}&device={}&address={}",
+    let url = format!(
+        "http://{host}{prefix}{route}?software={}&device={}&address={}",
         encode(&config.software),
         encode(&config.device),
         encode(&config.address)
     );
-    let addr = host.to_socket_addrs()?.next().ok_or_else(|| Error::Url(config.url.clone()))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(20))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
-    let head = format!(
-        "{method} {prefix}{route}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
-    let mut reply = Vec::new();
-    stream.take(MOST_BYTES).read_to_end(&mut reply)?;
-    let end = reply.windows(4).position(|w| w == b"\r\n\r\n").ok_or(Error::Reply)?;
-    let status =
-        std::str::from_utf8(&reply[..end]).ok().and_then(|h| h.split(' ').nth(1)?.parse().ok()).ok_or(Error::Reply)?;
-    Ok((status, reply.split_off(end + 4)))
+    let mut response = match body {
+        None => agent.get(&url).call(),
+        Some(data) => agent.post(&url).send(data),
+    }
+    .map_err(ureq::Error::into_io)?;
+    let status = response.status().as_u16();
+    let payload = response.body_mut().with_config().limit(MOST_BYTES).read_to_vec().map_err(ureq::Error::into_io)?;
+    Ok((status, payload))
 }
 
 /// One round: a batch asked, searched and posted. `Ok(true)` when the server had a batch.
@@ -128,19 +122,36 @@ fn request(config: &Config, method: &str, route: &str, body: &[u8]) -> Result<(u
 /// # Errors
 /// When a request fails. A result the server refuses is counted, not an error.
 pub fn round(config: &Config, stats: &Stats) -> Result<bool, Error> {
-    let (status, raw) = request(config, "GET", "/sky/v1/batch", &[])?;
-    if status != 200 {
-        return Ok(false);
+    let agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(120)))
+        .build()
+        .new_agent();
+    let (status, raw) = request(&agent, config, "/sky/v1/batch", None)?;
+    match status {
+        200 => {}
+        204 => return Ok(false),
+        other => return Err(Error::Status(other)),
     }
     let Ok(result) = crate::run_threads(&raw, config.threads) else {
         return Err(Error::Reply);
     };
-    let (status, _) = request(config, "POST", "/sky/v1/result", &result)?;
-    if status == 200 {
-        stats.batches.fetch_add(1, Ordering::Relaxed);
-        stats.curves.fetch_add(((result.len() - 44) / (crate::KEEP * crate::ENTRY_BYTES)) as u64, Ordering::Relaxed);
-    } else if status != 409 {
-        stats.refused.fetch_add(1, Ordering::Relaxed); // 409: the batch was settled while this miner searched it
+    let (status, _) = request(&agent, config, "/sky/v1/result", Some(&result))?;
+    match status {
+        200 => {
+            stats.batches.fetch_add(1, Ordering::Relaxed);
+            stats
+                .curves
+                .fetch_add(((result.len() - 44) / (crate::KEEP * crate::ENTRY_BYTES)) as u64, Ordering::Relaxed);
+        }
+        409 => {} // Another worker settled the batch.
+        404 | 413 | 422 => {
+            stats.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        other => return Err(Error::Status(other)),
     }
     Ok(true)
 }
@@ -234,6 +245,7 @@ pub fn status(stats: &Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
     #[test]
@@ -261,7 +273,48 @@ mod tests {
         assert_eq!(encode("neb miner/1.0 \u{b5}"), "neb%20miner%2F1.0%20%C2%B5");
     }
 
-    /// A server of two requests: hands out one batch, then keeps what is posted.
+    fn mock_server(replies: Vec<Vec<u8>>) -> (Config, JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = Config {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            device: "card 1".into(),
+            threads: 2,
+            ..Config::default()
+        };
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.contains("device=card%201"));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.split_once(':').unwrap();
+                    if key.eq_ignore_ascii_case("Content-Length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                bodies.push(body);
+                stream.write_all(&reply).unwrap();
+            }
+            bodies
+        });
+        (config, server)
+    }
+
+    fn empty_response(status: u16) -> Vec<u8> {
+        format!("HTTP/1.1 {status} Status\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").into_bytes()
+    }
+
     #[test]
     fn asks_searches_and_posts() {
         let mut batch = b"NEBS\x01\0\0\0\x02\0\0\0".to_vec();
@@ -269,52 +322,53 @@ mod tests {
             batch.extend_from_slice(&n.to_le_bytes());
             batch.extend((0..n).map(|i| if i % 9 < 2 { 0xB0 } else { 3 }));
         }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let served = batch.clone();
-        let server = thread::spawn(move || {
-            let mut posted = Vec::new();
-            for (i, stream) in listener.incoming().take(2).enumerate() {
-                let mut stream = stream.unwrap();
-                let mut seen = Vec::new();
-                let mut buf = [0u8; 4096];
-                // read the head, then the body its content-length announces
-                let (end, length) = loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    seen.extend_from_slice(&buf[..n]);
-                    if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&seen[..end]).to_string();
-                        let length: usize = head
-                            .split("Content-Length: ")
-                            .nth(1)
-                            .unwrap()
-                            .split("\r\n")
-                            .next()
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        break (end + 4, length);
-                    }
-                };
-                while seen.len() < end + length {
-                    let n = stream.read(&mut buf).unwrap();
-                    seen.extend_from_slice(&buf[..n]);
-                }
-                let head = String::from_utf8_lossy(&seen[..end]).to_string();
-                assert!(head.contains("device=card%201"), "{head}");
-                let body = if i == 0 { served.clone() } else { b"ok".to_vec() };
-                posted = seen.split_off(end);
-                stream
-                    .write_all(format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes())
-                    .unwrap();
-                stream.write_all(&body).unwrap();
+        let mut fixed = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", batch.len()).into_bytes();
+        fixed.extend_from_slice(&batch);
+        let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for part in batch.chunks(13) {
+            write!(chunked, "{:x}\r\n", part.len()).unwrap();
+            chunked.extend_from_slice(part);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        for reply in [fixed, chunked] {
+            let (config, server) = mock_server(vec![reply, empty_response(200)]);
+            let stats = Stats::default();
+            assert!(round(&config, &stats).unwrap());
+            assert_eq!(server.join().unwrap(), [Vec::new(), crate::run(&batch).unwrap()]);
+            assert_eq!((stats.batches.load(Ordering::Relaxed), stats.curves.load(Ordering::Relaxed)), (1, 2));
+        }
+    }
+
+    #[test]
+    fn only_no_content_means_no_batch() {
+        for status in [204, 403, 404, 429, 500] {
+            let (config, server) = mock_server(vec![empty_response(status)]);
+            let outcome = round(&config, &Stats::default());
+            if status == 204 {
+                assert!(matches!(outcome, Ok(false)));
+            } else {
+                assert!(matches!(outcome, Err(Error::Status(code)) if code == status));
             }
-            posted
-        });
-        let config = Config { url, device: "card 1".into(), threads: 2, ..Config::default() };
-        let stats = Stats::default();
-        assert!(round(&config, &stats).unwrap());
-        assert_eq!(server.join().unwrap(), crate::run(&batch).unwrap());
-        assert_eq!((stats.batches.load(Ordering::Relaxed), stats.curves.load(Ordering::Relaxed)), (1, 2));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn distinguishes_refused_results_from_a_busy_or_unavailable_server() {
+        for (status, refused, failed) in [(409, 0, false), (422, 1, false), (429, 0, true), (503, 0, true)] {
+            let mut batch = b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\n".to_vec();
+            batch.extend_from_slice(b"NEBS\x01\0\0\0\0\0\0\0");
+            let (config, server) = mock_server(vec![batch, empty_response(status)]);
+            let stats = Stats::default();
+            let outcome = round(&config, &stats);
+            if failed {
+                assert!(matches!(outcome, Err(Error::Status(code)) if code == status));
+            } else {
+                assert!(matches!(outcome, Ok(true)));
+            }
+            assert_eq!(stats.refused.load(Ordering::Relaxed), refused);
+            server.join().unwrap();
+        }
     }
 }
