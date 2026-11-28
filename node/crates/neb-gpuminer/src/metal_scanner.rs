@@ -74,12 +74,13 @@ fn table_pipeline_options(
     read: u8,
     pair_style: PairBuilder,
 ) -> Result<(ComputePipelineState, u64), String> {
-    let width = if mask & 16 == 0 { 128 } else { 256 };
-    if pair_style == PairBuilder::DirectMaskedTwoRows {
-        table_pipeline_geometry(device, mask, build, read, pair_style, 64, 1)
-    } else {
-        table_pipeline_geometry(device, mask, build, read, pair_style, width, 0)
-    }
+    let width = match pair_style {
+        PairBuilder::TwoRows | PairBuilder::DirectMaskedTwoRows => 32,
+        _ if mask & 16 == 0 => 128,
+        _ => 256,
+    };
+    let direct = u8::from(pair_style == PairBuilder::DirectMaskedTwoRows);
+    table_pipeline_geometry(device, mask, build, read, pair_style, width, direct)
 }
 fn table_pipeline_geometry(
     device: &Device,

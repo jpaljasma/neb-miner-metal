@@ -59,7 +59,7 @@ impl MetalScanner {
         }
         let kind = if c.reuse.is_some() { 4 } else { 2 };
         let pipelines = if geometry {
-            (0..9)
+            (0..12)
                 .map(|id| {
                     table_pipeline_geometry(
                         &self.device,
@@ -67,7 +67,7 @@ impl MetalScanner {
                         kind,
                         0,
                         PairBuilder::MaskedTwoRows,
-                        [256, 128, 64][id / 3],
+                        [256, 128, 64, 32][id / 3],
                         (id % 3) as u8,
                     )
                 })
