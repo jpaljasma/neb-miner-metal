@@ -23,6 +23,8 @@ class Dashboard(unittest.TestCase):
         s = Session()
         def event(name, conn, **fields):
             s.update(dict(utc="2026-11-27T12:00:00+00:00", connection=conn, event=name, **fields))
+        event("start", 0)
+        self.assertEqual(s.sky_threads, 0)
         event("start", 0, sky_threads=2)
         event("miner_started", 1, pid=111)
         event("sky_sample", 1, curves=11, batches=1, refused=0, errors=0)

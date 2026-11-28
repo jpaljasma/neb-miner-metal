@@ -115,7 +115,7 @@ class Session:
         message = None
         if name == "start":
             self.worker = r.get("worker") or "unnamed"
-            self.sky_threads = r.get("sky_threads")
+            self.sky_threads = r.get("sky_threads", 0)
         elif name == "miner_started":
             self.pid = r.get("pid")
             self.sky_sample = None
