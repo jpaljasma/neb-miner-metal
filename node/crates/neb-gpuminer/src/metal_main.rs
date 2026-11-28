@@ -14,15 +14,14 @@ mod apple {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
         time::{Duration, Instant},
     };
 
     const DATASET_HASH: &str = "790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72";
-    const USAGE: &str =
-        "neb-miner-metal --dataset FILE (--node HOST:PORT [--stratum-adapter [--tess-ahead]] | --benchmark)";
+    const USAGE: &str = "neb-miner-metal --dataset FILE (--node HOST:PORT [--stratum-adapter [--tess-ahead]] [--sky http://HOST:PORT [--sky-threads N] [--sky-address ADDRESS] [--sky-device TEXT]] | --benchmark)";
 
     // A failing model probe or audit makes the existing GPU worker rescan the
     // range with this scanner. A small capacity keeps subsequent CPU batches short.
@@ -66,10 +65,20 @@ mod apple {
         }
     }
 
-    fn mine(addr: &str, datasets: Vec<SharedDataset>, selective: bool, tess_ahead: bool) -> Result<(), String> {
+    fn mine(
+        addr: &str,
+        datasets: Vec<SharedDataset>,
+        selective: bool,
+        tess_ahead: bool,
+        sky: neb_sky::client::Options,
+    ) -> Result<(), String> {
         let mut lanes = Vec::new();
+        let mut card = String::new();
         for (slot, dataset) in datasets.into_iter().enumerate() {
             let mut scanner = MetalScanner::for_slot(dataset.clone(), slot)?;
+            if slot == 0 {
+                card = scanner.device_name().to_owned();
+            }
             if slot == 1 && tess_ahead {
                 scanner.enable_tess_ahead().listen();
             }
@@ -83,7 +92,11 @@ mod apple {
             });
             lanes.push(Lane { dataset, scanner: Box::new(scanner), fallback: Some(fallback) });
         }
+        let sky =
+            sky.config(concat!("neb-miner-metal ", env!("CARGO_PKG_VERSION")), &card, 1).map_err(|e| e.to_string())?;
         let handle = neb_cpuminer::start_with(addr, "neb-miner-metal", |_| vec![]).map_err(|e| e.to_string())?;
+        let sky_stop = Arc::new(AtomicBool::new(false));
+        let sky_stats = sky.map(|config| neb_sky::client::spawn(config, sky_stop.clone()).1);
         let mismatches = Arc::new(AtomicU64::default());
         let fallbacks = Arc::new(AtomicU64::default());
         let worker =
@@ -105,10 +118,14 @@ mod apple {
                 );
                 last = (Instant::now(), n);
                 log_slots(s, "sample");
+                if let Some(stats) = &sky_stats {
+                    eprintln!("{}", neb_sky::client::status(stats));
+                }
             }
         }
         let reason = if handle.stopped() { handle.stats().disconnect_message() } else { "scanner stopped" };
         let stats = handle.stats().clone();
+        sky_stop.store(true, Ordering::Relaxed);
         handle.stop();
         worker.join().map_err(|_| "scanner panicked")?;
         log_slots(&stats, "final");
@@ -238,6 +255,8 @@ mod apple {
     pub fn run() -> Result<(), String> {
         let mut args = std::env::args().skip(1);
         let (mut dataset, mut node, mut bench, mut selective, mut tess_ahead) = (None, None, false, false, false);
+        let mut sky = neb_sky::client::Options::default();
+        let mut sky_requested = false;
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--help" | "-h" => {
@@ -249,14 +268,20 @@ mod apple {
                 "--benchmark" => bench = true,
                 "--stratum-adapter" => selective = true,
                 "--tess-ahead" => tess_ahead = true,
+                "--sky" | "--sky-threads" | "--sky-address" | "--sky-device" => {
+                    if !sky.take(&a, &args.next().ok_or(USAGE)?) {
+                        return Err(USAGE.into());
+                    }
+                    sky_requested = true;
+                }
                 _ => return Err(USAGE.into()),
             }
         }
         let pin = blake3::Hash::from_hex(DATASET_HASH).unwrap();
         let datasets = load_datasets(Path::new(&dataset.ok_or(USAGE)?), Some(pin.as_bytes()))?;
         match (node, bench) {
-            (Some(addr), false) if !tess_ahead || selective => mine(&addr, datasets, selective, tess_ahead),
-            (None, true) => benchmark(datasets),
+            (Some(addr), false) if !tess_ahead || selective => mine(&addr, datasets, selective, tess_ahead, sky),
+            (None, true) if !sky_requested => benchmark(datasets),
             _ => Err(USAGE.into()),
         }
     }

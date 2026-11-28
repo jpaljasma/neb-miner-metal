@@ -1,0 +1,16 @@
+[package]
+name = "neb-sky"
+description = "The sky search job: a box search for repeating dips in light curves, integers only (spec/sky-search.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neb-sky"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+
+[lints]
+workspace = true

@@ -440,6 +440,7 @@ dependencies = [
  "neb-engines",
  "neb-node",
  "neb-pow",
+ "neb-sky",
  "neb-wallet",
  "objc",
 ]
@@ -470,6 +471,13 @@ version = "1.0.9"
 dependencies = [
  "blake3",
  "cc",
+]
+
+[[package]]
+name = "neb-sky"
+version = "1.0.9"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]

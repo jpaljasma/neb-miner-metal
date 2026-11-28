@@ -6,6 +6,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import curses
 import json
 from pathlib import Path
@@ -21,6 +22,37 @@ SLOTS = ("Kepler", "TESS")
 
 def mh(rate):
     return "—" if rate is None else f"{rate / 1e6:,.2f} MH/s"
+
+
+def compact_difficulty(value):
+    try:
+        n = Decimal(str(value))
+    except InvalidOperation:
+        return "—"
+    if not n.is_finite() or n <= 0:
+        return "—"
+    for suffix in ("", "K", "M", "G", "T", "P", "E"):
+        if n < Decimal("999.995"):
+            if suffix:
+                return f"{n:.2f}{suffix}"
+            return format(n, "f")
+        n /= 1000
+    return f"{Decimal(str(value)):.2E}"
+
+
+def work_time(ns):
+    seconds = ns // 1_000_000_000
+    if seconds < 60:
+        tenth = ns // 100_000_000 % 10
+        return f"{seconds}.{tenth}s" if tenth else f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours:02}h {minutes:02}m {seconds:02}s"
+    if hours:
+        return f"{hours}h {minutes:02}m {seconds:02}s"
+    return f"{minutes}m {seconds:02}s"
 
 
 @dataclass
@@ -62,6 +94,7 @@ class Session:
         self.previous = {}
         self.sent_at = {}
         self.conn = 0
+        self.pid = self.sky_threads = self.sky_sample = None
         self.recent = deque(maxlen=12)
 
     def update(self, r):
@@ -75,12 +108,21 @@ class Session:
             self.sent_at.clear()
             self.difficulty = "—"
             self.conn = conn
+            self.pid = self.sky_sample = None
         slot = r.get("slot")
         model = self.models[slot] if slot in (0, 1) else None
         label = SLOTS[slot] if model else "Unknown model"
         message = None
         if name == "start":
             self.worker = r.get("worker") or "unnamed"
+            self.sky_threads = r.get("sky_threads")
+        elif name == "miner_started":
+            self.pid = r.get("pid")
+            self.sky_sample = None
+        elif name == "miner_reaped":
+            self.pid = None
+        elif name == "sky_sample":
+            self.sky_sample = r
         elif name == "tcp_connected":
             self.status, self.transport = "Connected", "TCP"
         elif name == "tls_connected":
@@ -171,7 +213,21 @@ def device_usage():
         return "unavailable"
 
 
-def draw(screen, s, gpu, colors, now):
+def miner_cpu_usage(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return "—"
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "pcpu=,comm="],
+                                capture_output=True, text=True, timeout=1, check=True)
+        pct, command = result.stdout.strip().split(None, 1)
+        if Path(command).name == "neb-miner-metal":
+            return f"{float(pct):.1f}%"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return "—"
+
+
+def draw(screen, s, gpu, colors, now, cpu="—"):
     height, width = screen.getmaxyx()
     screen.erase()
     def put(y, x, value, style=0, length=None):
@@ -181,22 +237,35 @@ def draw(screen, s, gpu, colors, now):
     green, dim, alert = colors
     stale = s.status == "Mining" and now - s.last > 20
     status = "No recent data" if stale else s.status
+    sky = None
+    if s.sky_threads:
+        unit = "thread" if s.sky_threads == 1 else "threads"
+        sky = f"SKY SEARCH  ON · {s.sky_threads} {unit}"
+    elif s.sky_threads == 0:
+        sky = "SKY SEARCH  OFF"
     if width < 58 or height < 18:
         put(0, 0, f"NEB · {status}", alert if stale else green)
         for slot, model in enumerate(s.models):
             active = "*" if slot == s.slot and status == "Mining" else " "
             put(slot + 1, 0, f"{active}{SLOTS[slot]:6} {mh(model.last_rate):>12}  {model.accepted} ok  {model.rejected} rej")
-        put(4, 0, "58×18 for full dashboard · q closes viewer", dim)
+        put(3, 0, f"GPU   {gpu}", dim)
+        put(4, 0, f"CPU   {cpu}", dim)
+        if sky:
+            put(5, 0, sky, green if s.sky_threads else dim)
+        put(6, 0, "58×18 for full dashboard · q closes viewer", dim)
         screen.refresh()
         return
     for y, line in enumerate(LOGO):
         put(y, 1, line, green)
-    put(1, 23, "METAL  /  NEB", curses.A_BOLD)
-    put(2, 23, s.worker, dim, width-42)
-    put(3, 23, f"● {status}  ·  {s.transport}", alert if stale else green)
+    telemetry_x = max(38, width-32)
+    title_space = telemetry_x-23-1
+    put(1, 23, "METAL  /  NEB", curses.A_BOLD, title_space)
+    put(2, 23, s.worker, dim, title_space)
+    put(3, 23, f"● {status}  ·  {s.transport}", alert if stale else green, title_space)
     if s.last:
         stamp = datetime.fromtimestamp(s.last).strftime("%H:%M:%S")
-        put(4, 23, f"Last event {stamp}  ·  {max(0, int(now-s.last))}s ago", dim)
+        prefix = "Last event " if title_space >= 32 else ""
+        put(4, 23, f"{prefix}{stamp} · {max(0, int(now-s.last))}s ago", dim, title_space)
     def panel(x, w, title, rows):
         put(5, x, "╭─ "+title+" "+"─"*max(0,w-len(title)-5)+"╮", green, w)
         for y, (k,v) in enumerate(rows, 6):
@@ -205,7 +274,17 @@ def draw(screen, s, gpu, colors, now):
             put(y,x+14,v,curses.A_BOLD,w-16)
             put(y,x+w-1,"│",dim)
         put(6+len(rows), x, "╰"+"─"*(w-2)+"╯", dim,w)
-    put(1, max(48,width-31), f"GPU   {gpu}",dim)
+    put(1, telemetry_x, f"GPU   {gpu}", dim)
+    put(2, telemetry_x, f"CPU   {cpu}", dim)
+    if sky:
+        put(3, telemetry_x, sky, green if s.sky_threads else dim)
+    if s.sky_sample is not None:
+        sample = s.sky_sample
+        if sample["errors"] or sample["refused"]:
+            put(4, telemetry_x, f"{sample['refused']} refused · {sample['errors']} errors", alert)
+        else:
+            unit = "batch" if sample["batches"] == 1 else "batches"
+            put(4, telemetry_x, f"{sample['curves']:,} curves · {sample['batches']:,} {unit}", dim)
     panel_width = min(width - 2, 140)
     left = (panel_width - 1) // 2
     for i, model in enumerate(s.models):
@@ -218,13 +297,13 @@ def draw(screen, s, gpu, colors, now):
             ("AVG ACTIVE", mh(model.average)),
             ("PEAK", mh(model.peak)),
             ("TICKETS", f"{model.tickets:,}"),
-            ("WORK TIME", f"{model.work_ns / 1e9:,.1f} s"),
+            ("WORK TIME", work_time(model.work_ns)),
             ("ACCEPTED", model.accepted),
             ("REJECTED", rejected),
             ("STALE", model.stale),
             ("PENDING", model.submitted - decided - model.unconfirmed),
             ("LAST ACK", "—" if model.ack_ms is None else f"{model.ack_ms:.0f} ms"),
-            ("DIFFICULTY", model.difficulty),
+            ("DIFFICULTY", compact_difficulty(model.difficulty)),
             ("JOB HEIGHT", f"#{model.height:,}" if model.height is not None else "—"),
             ("LAST ENGINE", model.engine),
             ("CANDIDATES", model.candidates),
@@ -256,18 +335,22 @@ def watch(screen, stream):
         curses.init_pair(3,250 if curses.COLORS >= 256 else curses.COLOR_WHITE,curses.COLOR_BLACK)
         colors=(curses.color_pair(1)|curses.A_BOLD,curses.color_pair(3),curses.color_pair(2))
     state=Session()
-    next_gpu=0
-    gpu="—"
+    next_sample=0
+    sampled_pid=None
+    gpu=cpu="—"
     while True:
         read_events(stream,state)
         now=time.time()
         if state.status=="Mining" and now-state.last<20:
-            if time.monotonic()>=next_gpu:
+            if time.monotonic()>=next_sample or sampled_pid!=state.pid:
                 gpu=device_usage()
-                next_gpu=time.monotonic()+5
+                cpu=miner_cpu_usage(state.pid)
+                sampled_pid=state.pid
+                next_sample=time.monotonic()+5
         else:
-            gpu="—"
-        draw(screen,state,gpu,colors,now)
+            gpu=cpu="—"
+            next_sample=0
+        draw(screen,state,gpu,colors,now,cpu)
         if screen.getch() in (ord("q"),ord("Q"),27): return
 
 

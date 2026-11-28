@@ -1,5 +1,6 @@
 """Offline Stratum fault tests. No external socket is opened."""
 import asyncio
+from argparse import Namespace
 from collections import Counter
 import json
 import struct
@@ -8,6 +9,17 @@ import unittest
 from unittest.mock import patch
 
 import test_metal_stratum as bridge
+
+
+class SkyOptions(unittest.TestCase):
+    def test_sky_is_opt_in_and_does_not_copy_the_pool_login(self):
+        args = Namespace(sky=None, sky_threads=None, sky_address=None, sky_device=None, worker="pool-worker")
+        self.assertEqual(bridge.sky_flags(args), [])
+        args.sky, args.sky_threads, args.sky_device = "http://localhost:9000", 2, "test device"
+        self.assertEqual(bridge.sky_flags(args), ["--sky", args.sky, "--sky-threads", "2", "--sky-device", "test device"])
+        args.sky_address = "explicit-address"
+        self.assertEqual(bridge.sky_flags(args), ["--sky", args.sky, "--sky-threads", "2",
+                                                "--sky-address", "explicit-address", "--sky-device", "test device"])
 
 
 class Transport(unittest.IsolatedAsyncioTestCase):
