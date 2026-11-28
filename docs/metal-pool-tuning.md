@@ -219,3 +219,32 @@ The separate time-limited replay compared the original and optimized shaders onc
 Production already selected the exhaustive engine on the all-live model and the selective engine on the two trained jobs. Building the dense seed’s full pair table cost another 14.58 seconds for the experiment. The existing per-model selection was the better routing policy on this workload.
 
 **Official NEB compatibility.** SilasEigen v1.0.10 avoids duplicate block proof/share checks on the node and changes how a damaged or missing index is rebuilt. Upstream recommends it for node and pool operators. Version 1.0.11 adds optional CPU sky search for faint TESS stars. The reference mining C code, Rust share module, pool specification and proof-of-work specification in this fork match v1.0.11 byte for byte. The sky client, specification and reference vectors are from that tag. [Official releases](https://github.com/SilasEigen/neb/releases) · [v1.0.10](https://github.com/SilasEigen/neb/releases/tag/v1.0.10) · [v1.0.11](https://github.com/SilasEigen/neb/releases/tag/v1.0.11)
+
+## Feeding the M1 Max GPU
+
+The selective worker keeps 4,194,304 nonces per dispatch while the pair table is growing. Once the table is complete it submits 16,777,216. This keeps the original cadence for building table slices and reduces the number of CPU/GPU waits on long jobs. The work-service socket reader wakes the compute thread when a fresh job arrives, including after an extranonce roll. A separate Rust thread preloads the screen resources and the first pair pipeline while the model workers prepare the job. The scanner retains distinct pair pipelines for fresh and reused entries.
+
+The initial experiment crossed 4/8/16 million nonces, 64/128/256 threads per group, and one or 64 evaluation counters. A separate run compared one, two and four queued commands on the same ranges. All timed arms returned identical counts and hit sets. More queued commands, wider groups and sharded counters did not consistently improve on a single large submission with the existing 128-thread group. [Baseline](https://github.com/jpaljasma/neb-miner-metal/commit/a43007a)
+
+The final screen comparison alternated 4, 8 and 16 million nonces per command across 64 matched blocks per model on each of three fixtures. Every block covered the same 16,777,216 raw nonces in each arm. GPU coverage is Metal command execution time divided by elapsed wall time.
+
+| Model | Completed-ticket gain, 16M vs 4M, fixtures A / B / C | GPU coverage at 4M | GPU coverage at 16M |
+| --- | ---: | ---: | ---: |
+| Kepler | +9.29% / +11.11% / +8.72% | 87.4–89.6% | 95.7–96.7% |
+| TESS | +12.59% / +8.99% / +10.39% | 85.9–89.8% | 96.1–96.7% |
+
+A second replay included CPU share verification and the worker's normal audit cadence. For each model, three matched six-second settled windows gained 5.85–12.18% on Kepler and 10.05–10.85% on TESS. Device-wide GPU load sampled during those windows averaged 77.8% → 78.9% on Kepler and 74.2% → 75.4% on TESS (39–42 samples per arm). Work takes longer to return with the larger batch. Across fixtures, the 95th-percentile audited batch rose from 5.9–6.8 to 12.3–17.0 ms on Kepler and from 6.7–7.6 to 20.5–26.4 ms on TESS. These are local timing measurements; they do not establish a pool stale-share rate.
+
+### Shared memory and model preparation
+
+CPU workers write directly into padded Metal gradient rows. On a warm scanner the current and spare shared buffers alternate. This removes one allocation and one staging copy of 46.45 MiB per Kepler refresh or 24.57 MiB per TESS refresh. When the previous compact model predicts that single-row digests will be needed, each worker also writes those digests from its gradient scratch before reusing it. Cold starts retain the density check and can build singles after the row pass. Twenty timed refreshes per transition measured median Kepler setup at 283.2 → 269.1 ms and 292.8 → 267.4 ms. TESS measured 150.3 → 142.0 ms and 142.5 → 143.0 ms.
+
+The mining worker borrows the completed GPU hit list from shared memory and reuses its confirmed-share vector. The initial hit buffer is 16 KiB per slot. If an easy target fills it, the GPU records the total count and the host repeats the identical range with enough room for every nonce. Only the complete pass is credited. Metal audits can compare a full 32-byte ticket in one dispatch.
+
+### Exhaustive Kepler
+
+Exhaustive mining evaluates every nonce. On one recorded Kepler job with 8,977 live rows among 13,404, even a complete 1.29 GB pair table admitted only four of 1,048,576 test nonces. Exhaustive was the productive engine. On models with at least 25% and fewer than 50% idle rows, the exhaustive kernel now compacts its row indices and loads four adjacent signed factors at a time before transposing them in threadgroup memory. The 256-thread group keeps the GPU busy on the remaining rows. Below 25% idle the full-width path is retained. The pair-screen eligibility threshold stays at 50% idle.
+
+The 37-arm sweep tested group width, scalar/vector factor loads, compile-time loop width and Rust host preparation. A follow-up covered an all-live control, 12% and 25% idle mixtures, and the recorded job. In three matched replays through the production work-service binary on that job, throughput rose from 0.910–0.916 to 1.049–1.061 MH/s (+15.26–15.89%). Exact ticket checks include repeated samples and the end of the nonce space.
+
+Build the `metal_selected` and `metal_factorial` release examples with the `metal-bench` feature. Run `metal_selected DATASET MODEL_DIR parallelism` for matched dispatch size, evaluated tickets, GPU time and latency. Run `metal_factorial DATASET MODEL_DIR exhaustive` for the full and vector-loaded exhaustive comparison, or `exhaustive-confirm 1` on a fresh capture. Use the same models, headers and nonce ranges for each arm.

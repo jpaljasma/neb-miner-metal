@@ -103,3 +103,58 @@ fn mine_and_check(kind: EngineKind) -> Arc<Engine> {
     let _ = std::fs::remove_dir_all(&dir);
     engine
 }
+
+#[test]
+fn socket_reader_wakes_the_worker_for_new_jobs_and_shutdown() {
+    use neb_pow::shares::Model;
+    use neb_work::frames::{self, Job};
+    use std::{
+        io::Write,
+        net::{Shutdown, TcpListener},
+        sync::mpsc,
+        thread,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let miner = neb_cpuminer::start_with(listener.local_addr().unwrap(), "wake-test", |_| vec![]).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    let session = miner.session();
+    peer.write_all(&frames::model_frame(0, &Model::from_seed(&[0; 32]))).unwrap();
+    let mut job = Job {
+        id: 1,
+        clean: true,
+        version: 1,
+        parent: [0; 32],
+        time_start: 1,
+        time_window: 1,
+        bits: 0x1d00ffff,
+        target: [0; 32],
+        share_target: [255; 32],
+        coinbase_prefix: vec![],
+        coinbase_suffix: vec![],
+        extranonce_size: 1,
+        branch: vec![],
+        tx_count: 1,
+        shares_root: [0; 32],
+        height: 1,
+        expiry: 2,
+    };
+    peer.write_all(&job.encode()).unwrap();
+    session.wait_for_job_change(None, Duration::from_secs(3));
+    let first = session.current().unwrap();
+    job.id = 2;
+    peer.write_all(&job.encode()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        session.wait_for_job_change(Some(&first), Duration::from_secs(12));
+        let next = session.current().unwrap();
+        tx.send(next.job.id).unwrap();
+        session.wait_for_job_change(Some(&next), Duration::from_secs(12));
+        tx.send(u64::from(session.stopped())).unwrap();
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
+    peer.shutdown(Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+    worker.join().unwrap();
+    miner.stop();
+}

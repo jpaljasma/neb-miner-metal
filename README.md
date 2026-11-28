@@ -17,6 +17,8 @@ The two miners make different tradeoffs. This backend spent 306 ms on Kepler and
 
 The trained-model screen can stop the last ChaCha8 round as soon as a nonce has too many live rows for the pair table. In ten-second settled Kepler replays, the M1 Max completed **2.1–4.2% more tickets** across three recorded models. [GPU comparisons and methods](docs/metal-pool-tuning.md#suprminer-1963-and-intel-arc)
 
+On the 64 GB M1 Max, the miner preloads the Metal pipelines and prepares gradient rows directly in shared memory. Larger dispatches after table warm-up raised **audited throughput by 5.9–12.2% on Kepler and 10.0–10.9% on TESS** across three recorded model transitions. On a moderately dense Kepler model the exhaustive engine also improved from **0.91 to 1.05–1.06 MH/s**. [GPU utilization, latency and exhaustive replays](docs/metal-pool-tuning.md#feeding-the-m1-max-gpu)
+
 ## Pool mining on M1 Max
 
 In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s** and TESS averaged **93.30 MH/s**. Each rate counts completed tickets over the time the pool assigned that model, including setup. Suprnova accepted 59 of 59 Kepler shares and 19 of 20 TESS shares. One TESS share went stale at a job change. [Pool tests and tuning](docs/metal-pool-tuning.md)

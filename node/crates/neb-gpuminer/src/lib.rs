@@ -15,6 +15,7 @@
 //! once for each model and builds an attempt from 16 rows; on a disagreement it gives way to the default one. A scan never returns a partial result: a range with more hits than the device
 //! can report is split ([`scan_complete`]).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -77,6 +78,16 @@ pub const BATCH: u32 = 1 << 16;
 pub trait Scanner: Send {
     /// Most nonces one scan can cover.
     fn capacity(&self) -> u32;
+    /// Compare one ticket exactly. Devices exposing only hits use both target boundaries.
+    fn matches_ticket(&mut self, header: &[u8; 80], nonce: u32, reference: &[u8; 32]) -> Result<bool, String> {
+        if self.scan(header, nonce, 1, reference)? != [nonce] {
+            return Ok(false);
+        }
+        Ok(match minus_one(reference) {
+            None => true,
+            Some(below) => self.scan(header, nonce, 1, &below)?.is_empty(),
+        })
+    }
     fn mining_mode(&self) -> Option<&'static str> {
         None
     }
@@ -95,6 +106,19 @@ pub trait Scanner: Send {
     ) -> Result<(Vec<u32>, u32), String> {
         Ok((self.scan(header, start, count, bound)?, count))
     }
+    /// A synchronous GPU backend may lend its completed shared-memory hit list until its next scan.
+    fn mine_range_view(
+        &mut self,
+        model: &Model,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        bound: &[u8; 32],
+    ) -> Result<(Cow<'_, [u32]>, u32), String> {
+        let (hits, evaluated) = self.mine_range(model, header, start, count, bound)?;
+        Ok((Cow::Owned(hits), evaluated))
+    }
+
     fn request_roll(&self) -> bool {
         false
     }
@@ -156,20 +180,15 @@ fn minus_one(value: &[u8; 32]) -> Option<[u8; 32]> {
 }
 
 /// True when the ticket of `nonce` on `header` is exactly `reference` on the device: a one-nonce scan with the
-/// bound `reference` must hit, and one with the bound `reference - 1` must not.
+/// bound `reference` must hit, and one with the bound `reference - 1` must not. Backends that return
+/// complete tickets can compare all bytes directly.
 pub fn probe_ticket(
     scanner: &mut dyn Scanner,
     header: &[u8; 80],
     nonce: u32,
     reference: &[u8; 32],
 ) -> Result<bool, String> {
-    if scanner.scan(header, nonce, 1, reference)? != [nonce] {
-        return Ok(false);
-    }
-    Ok(match minus_one(reference) {
-        None => true,
-        Some(below) => scanner.scan(header, nonce, 1, &below)?.is_empty(),
-    })
+    scanner.matches_ticket(header, nonce, reference)
 }
 
 /// Nonces whose ticket the worker checks exactly (see [`probe_ticket`]) each time it uploads a model.
@@ -299,6 +318,7 @@ pub fn spawn_worker_with_fallback(
         let mut batches = 0u64;
         let mut requested_roll = None;
         let mut previous_mode = None;
+        let mut confirmed = Vec::new();
         // Replaces the scanner by the fallback and uploads `model` to it; false when that is impossible.
         let switch =
             |scanner: &mut Box<dyn Scanner>, fallback: &mut Option<Fallback>, model: &Model, why: &str| -> bool {
@@ -321,7 +341,7 @@ pub fn spawn_worker_with_fallback(
             };
         while !session.stopped() {
             let Some(unit) = session.current() else {
-                thread::sleep(Duration::from_millis(20));
+                session.wait_for_job_change(None, Duration::from_millis(20));
                 continue;
             };
             // a job of a slot without a lane, or whose model is of another network than the lane's dataset (an old
@@ -329,7 +349,7 @@ pub fn spawn_worker_with_fallback(
             let Some((Lane { dataset, scanner, fallback }, loaded)) =
                 lanes.get_mut(unit.slot as usize).filter(|(l, _)| l.dataset.arch() == unit.model.arch())
             else {
-                thread::sleep(Duration::from_millis(200));
+                session.wait_for_job_change(Some(&unit), Duration::from_millis(200));
                 continue;
             };
             let batch_started = std::time::Instant::now();
@@ -371,12 +391,12 @@ pub fn spawn_worker_with_fallback(
                     session.request_adapter_header(unit.job.id);
                     requested_roll = Some(unit.job.id);
                 }
-                thread::sleep(Duration::from_millis(20));
+                session.wait_for_job_change(Some(&unit), Duration::from_millis(20));
                 continue;
             };
-            let (confirmed, evaluated) = loop {
+            let evaluated = loop {
                 let (hits, evaluated) =
-                    match scanner.mine_range(&unit.model, &unit.header, start, count, &unit.share_target.0) {
+                    match scanner.mine_range_view(&unit.model, &unit.header, start, count, &unit.share_target.0) {
                         Ok(h) => h,
                         Err(e) => {
                             eprintln!("neb-miner-gpu: the device failed: {e}");
@@ -384,9 +404,9 @@ pub fn spawn_worker_with_fallback(
                         }
                     };
                 let mut header = unit.header;
-                let mut confirmed = Vec::with_capacity(hits.len());
+                confirmed.clear();
                 let mut refused = 0u64;
-                for nonce in hits {
+                for &nonce in hits.iter() {
                     let ticket = reference(&mut buffers, &mut header, nonce);
                     if unit.share_target.admits(&ticket) {
                         confirmed.push((nonce, ticket));
@@ -408,7 +428,7 @@ pub fn spawn_worker_with_fallback(
                     }
                     continue; // scan the batch again with K0
                 }
-                break (confirmed, evaluated);
+                break evaluated;
             };
             let mode = scanner.mining_mode().map(|m| (unit.slot, m));
             if previous_mode != mode {
@@ -427,7 +447,7 @@ pub fn spawn_worker_with_fallback(
             if session.superseded(&unit) {
                 continue;
             }
-            for (nonce, ticket) in confirmed {
+            for &(nonce, ticket) in &confirmed {
                 session.report_share(&unit, nonce);
                 if unit.target.admits(&ticket) {
                     session.report_solution(&unit, nonce);
