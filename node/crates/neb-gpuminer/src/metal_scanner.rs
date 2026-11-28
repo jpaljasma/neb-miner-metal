@@ -880,11 +880,18 @@ impl MetalScanner {
             tuning: Default::default(),
         })
     }
+    pub fn compile_selection_replay(&self, deferred_diagonals: bool) -> Result<PairScreenVariant, String> {
+        let mode = metal_screen::pair_mode(self.compact_tickets);
+        let mut tuning = metal_screen::PairTuning::production(self.compact_tickets, self.dataset.n());
+        tuning.deferred_diagonals = deferred_diagonals;
+        let pipeline = metal_screen::Screen::tuned_variant(&self.device, false, mode, tuning)?;
+        Ok(PairScreenVariant { pipeline, mode, tuning })
+    }
     pub fn compile_rank_tuning(&self, id: u8) -> Result<PairScreenVariant, String> {
         use metal_screen::{PairTuning, RankLayout, Screen};
         let threads = *[128, 64, 256].get((id / 3) as usize).ok_or("invalid tuning id")?;
         let ranks = [RankLayout::Plain, RankLayout::Tagged32, RankLayout::Tagged16][(id % 3) as usize];
-        let tuning = PairTuning { ranks, threads };
+        let tuning = PairTuning { ranks, threads, deferred_diagonals: true };
         let mode = metal_screen::pair_mode(self.compact_tickets);
         let pipeline = Screen::tuned_variant(&self.device, false, mode, tuning)?;
         Ok(PairScreenVariant { pipeline, mode, tuning })

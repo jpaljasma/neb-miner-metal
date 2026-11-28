@@ -189,3 +189,33 @@ The factorial example also accepts `queue`, `host`, `compact`, `tables` and the 
 For status during a timed session, run `python3 tools/report_metal_session.py --live LOG_DIRECTORY`. Omit `--live` for the final report. The per-slot report separates raw nonces screened from full tickets evaluated, unique job exposure from worker compute time, and acknowledged share difficulty from displayed hashrate. The final miner counters include the last partial sampling interval.
 
 The model-turnover replay compares exact three-row reconstruction, a two-row pair builder and selective row uploads across all eight combinations. It includes CPU parity checks, complete table hashes and the first 5, 15 and 30 seconds of work after a real weight transition. [Model-turnover results and replay commands](metal-turnover.md)
+
+## Suprminer 1.9.63 and Intel Arc
+
+Suprminer v1.9.63 improved settled Kepler on selected NVIDIA cards. The release reports +25.5% on the RTX 5090 and +11.5% on the RTX 3070 on one model. Other Kepler models varied. Some lighter models on the 5090 needed about 20 GiB of free system memory and a wide PCIe link. Radeon kept the v1.9.62 kernels. The release includes matched, CPU-verified benchmarks and binaries. Its public tree omits the GPU kernel source. These Metal experiments are independent implementations. [Release](https://github.com/ocminer/suprminer/releases/tag/v1.9.63) · [Matched fleet results](https://github.com/ocminer/suprminer/blob/v1.9.63/docs/benchmarks/neb-1.9.63-fleet.md)
+
+**Early nonce selection.** Suprminer documented selecting cheap attempts on AMD OpenCL in v1.9.49. Metal already used exact pair lookup. Our new screen stops the final four independent ChaCha8 diagonal quarter-rounds as soon as more than two live rows rule out the attempt. For a qualifying nonce all 16 words still contribute. A SIMD ballot counts eligible lanes and supplies TESS’s compaction offsets. Suprminer’s later Radeon releases publish device gains but do not identify this instruction sequence. [AMD selection and verification](https://github.com/ocminer/suprminer/releases/tag/v1.9.49) · [Newer AMD measurements](https://github.com/ocminer/suprminer/blob/v1.9.59/docs/benchmarks/neb-1.9.59-amd.md)
+
+**Result-table packing.** Suprminer documented reducing each entry from 32 to 28 bytes in v1.9.50. We tried a lossless eight-lane base/delta encoding in shared memory on the M1 Max. All four full tables fit and round-tripped. Packing saved 12.5% of entry storage. With the same table coverage and the other controls off, packing alone reduced completed tickets/s by 0.62–2.59% on Kepler and 3.23–5.00% on TESS. These timings exclude conversion cost. Production retains the 32-byte format. This test does not measure configurations where packing would allow more entries to fit. [Suprminer table layout](https://github.com/ocminer/suprminer/releases/tag/v1.9.50)
+
+**Metal results.** The Old/New figures below are completed MH/s on a 64 GiB M1 Max. Each screen confirmation alternated implementations within 96 matched eight-million-nonce blocks per model, using production dispatch sizes. Every block compared both eligible counts and hit sets. The intervals are paired 90% bootstrap intervals on wall-time throughput. Additional probes covered partial SIMD groups, the end of the nonce range, and exact and immediately lower targets against the CPU reference.
+
+| Fixture | Kepler old → new | Paired change (90% interval) | TESS old → new | Paired change (90% interval) |
+| --- | ---: | ---: | ---: | ---: |
+| A | 66.78 → 68.09 | +1.98% (+0.83 to +3.18%) | 290.08 → 303.25 | +4.51% (+3.44 to +5.57%) |
+| B | 13.49 → 14.20 | +5.24% (+4.77 to +5.71%) | 484.17 → 492.05 | +1.63% (+1.36 to +1.90%) |
+| C, fresh confirmation | 63.68 → 64.41 | +1.18% (−0.01 to +2.37%) | 274.50 → 284.63 | +3.67% (+2.26 to +5.08%) |
+
+The separate time-limited replay compared the original and optimized shaders once per transition. With pair tables ready, ten-second Kepler rates changed by +2.90%, +4.18% and +2.06% on A, B and C. Over the first 15 seconds after a TESS weight change, including setup, the changes were +2.77%, −0.17% and +3.61%. These are local replays on different fixtures from Suprminer’s fleet. Repeat the paired screen test with `metal_selected DATASET SNAPSHOT_DIR selection-confirm` on macOS using the `metal-bench` Cargo feature.
+
+**Intel-style recovery of skipped work.** Blockz-miner v1.1.5 describes trying nonces its fast filter skips on dense NEB jobs. Its published Linux batch-idling speedups were for other algorithms. The Intel miner is proprietary. We tested the described NEB policy with our exhaustive Metal engine. Each replay used four measured ranges of 262,144 nonces. The hybrid received the exact skipped list prepared outside the timer, giving it an optimistic estimate. It matched the exhaustive hit set on every range, and the CPU verified all returned hits. [Intel release](https://gitlab.com/jbman2005/blockz-miner/-/releases/v1.1.5) · [Intel miner licence](https://gitlab.com/jbman2005/blockz-miner/-/blob/v1.1.5/LICENSE)
+
+| Model | Pair screen MH/s | Exhaustive MH/s | Screen + backfill MH/s |
+| --- | ---: | ---: | ---: |
+| Seeded Kepler, all 13,404 rows live | 0 | 0.801 | 0.802 |
+| Trained Kepler, 5,983 live rows | 4.329 | 1.390 | 1.371 |
+| Trained TESS, 1,482 live rows | 130.155 | 1.492 | 1.993 |
+
+Production already selected the exhaustive engine on the all-live model and the selective engine on the two trained jobs. Building the dense seed’s full pair table cost another 14.58 seconds for the experiment. The existing per-model selection was the better routing policy on this workload.
+
+**Official NEB compatibility.** SilasEigen v1.0.10 avoids duplicate block proof/share checks on the node and changes how a damaged or missing index is rebuilt. Upstream recommends it for node and pool operators. Version 1.0.11 adds optional CPU sky search for faint TESS stars. The reference mining C code, Rust share module, pool specification and proof-of-work specification in this fork match v1.0.11 byte for byte. The sky client, specification and reference vectors are from that tag. [Official releases](https://github.com/SilasEigen/neb/releases) · [v1.0.10](https://github.com/SilasEigen/neb/releases/tag/v1.0.10) · [v1.0.11](https://github.com/SilasEigen/neb/releases/tag/v1.0.11)

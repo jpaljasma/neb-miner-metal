@@ -55,6 +55,9 @@ inline void qr_word(thread uint &a, thread uint &b, thread uint &c, thread uint 
 inline uint triangular_index(uint b) { return b*(b+1)/2; }
 inline uint triple_index(uint c) { return c*(c+1)*(c+2)/6; }
 
+// The reference and three-row paths need the complete ChaCha block in its original order.
+#define DEFER_PAIR (DEFER_DIAGONALS && RANK_LAYOUT && PAIRS_ONLY && SCALAR_CHACHA && !CHECK_RECORDS && !RECOVER_THREE)
+
 #if RANK_LAYOUT == 2
 typedef ushort RankWord;
 constant uint live_tag = 1u << 15;
@@ -99,7 +102,15 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     Hash cv={uint4(args[0],args[1],args[2],args[3]),uint4(args[4],args[5],args[6],args[7])};
     Hash key=compress<HEADER_COLUMNS>(cv,block,16,10,args);
     uint4 init=uint4(0x61707865,0x3320646e,0x79622d32,0x6b206574);
-    #if SCALAR_CHACHA
+    #if DEFER_PAIR
+    uint4 a=init, b=key.lo, c=key.hi, d=0;
+    #pragma clang loop unroll(full)
+    for(uint r=0;r<3;r++) {
+        qr(a,b,c,d); b=b.yzwx;c=c.zwxy;d=d.wxyz;
+        qr(a,b,c,d); b=b.wxyz;c=c.zwxy;d=d.yzwx;
+    }
+    qr(a,b,c,d);
+    #elif SCALAR_CHACHA
     uint x[16]={init.x,init.y,init.z,init.w,key.lo.x,key.lo.y,key.lo.z,key.lo.w,
                 key.hi.x,key.hi.y,key.hi.z,key.hi.w,0,0,0,0};
     #pragma clang loop unroll(full)
@@ -127,7 +138,17 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     uint rank_sum=0, largest=0;
     #pragma clang loop unroll(full)
     for(uint j=0;j<4;j++) {
-        uint4 sample=mulhi(words[j],uint4(args[12]));
+        #if DEFER_PAIR
+        // The last four diagonal quarter-rounds are independent. Consume all four
+        // output words from one diagonal before doing work on the next.
+        uint bi=(j+1)&3u, ci=(j+2)&3u, di=(j+3)&3u;
+        uint x=a[j], y=b[bi], z=c[ci], w=d[di];
+        qr_word(x,y,z,w);
+        uint4 words_j=uint4(x+init[j],y+key.lo[bi],z+key.hi[ci],w);
+        #else
+        uint4 words_j=words[j];
+        #endif
+        uint4 sample=mulhi(words_j,uint4(args[12]));
         uint4 tagged=uint4(ranks[sample.x],ranks[sample.y],ranks[sample.z],ranks[sample.w]);
         rank_sum+=tagged.x+tagged.y+tagged.z+tagged.w;
         if(rank_sum>=3u*live_tag) break;
@@ -224,14 +245,23 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
         }
     }
     #endif
+    #if DEFER_PAIR
+    uint vote=uint(static_cast<simd_vote::vote_t>(simd_ballot(eligible)));
+    uint evaluated=popcount(vote);
+    #else
     uint evaluated=simd_sum(uint(eligible));
+    #endif
     #if COMPACT_TICKETS && !CHECK_RECORDS
     // The host dispatches 32-lane SIMD groups. Pack eligible tickets
     // together so the final hash runs on occupied lanes.
     threadgroup PendingTicket pending[SCREEN_GROUP_THREADS];
     threadgroup uint group_counts[(SCREEN_GROUP_THREADS+31)/32];
     uint group=tid/32;
+    #if DEFER_PAIR
+    uint rank_in_group=popcount(vote & ((1u<<lane)-1u));
+    #else
     uint rank_in_group=simd_prefix_exclusive_sum(uint(eligible));
+    #endif
     if(lane==0) group_counts[group]=evaluated;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint before=0,total=0;
