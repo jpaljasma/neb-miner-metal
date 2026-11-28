@@ -2,6 +2,19 @@
 # Start the Suprnova adapter and open its live dashboard in macOS Terminal.
 set -eu
 umask 077
+sky_args=()
+while (( $# )); do
+  case "$1" in
+    --sky|--sky-threads|--sky-address|--sky-device)
+      (( $# >= 2 )) || { print -u2 "Missing value for $1"; exit 1; }
+      sky_args+=("$1" "$2")
+      shift 2 ;;
+    -h|--help)
+      print 'start-neb.command [--sky http://HOST:PORT [--sky-threads N] [--sky-address ADDRESS] [--sky-device TEXT]]'
+      exit 0 ;;
+    *) print -u2 "Unknown option: $1"; exit 1 ;;
+  esac
+done
 root=${0:A:h}
 cd "$root"
 python=/Library/Frameworks/Python.framework/Versions/3.11/bin/python3
@@ -48,6 +61,10 @@ for pid in ${(f)"$(/usr/bin/pgrep -U "$EUID" -f '[/ ]test_metal_stratum[.]py[[:s
     print -u2 'A session is already running on another pool or port. Stop that session before launching this one.'
     exit 1
   fi
+  if (( ${#sky_args} )); then
+    print -u2 'A worker is already running. Stop it before launching with sky options, or omit the options to open its dashboard.'
+    exit 1
+  fi
   log=$active
   break
 done
@@ -57,7 +74,7 @@ if [[ -z "$log" ]]; then
   log="$dir/events.jsonl"
   terminal "NEB · Pool worker" /usr/bin/caffeinate -i "$python" -u "$root/tools/test_metal_stratum.py" \
     --pool "$pool" --worker "$worker" --selective --tess-ahead --duration 86400 \
-    --pause-file "$dir/PAUSE" --log "$log"
+    --pause-file "$dir/PAUSE" --log "$log" "${sky_args[@]}"
   for attempt in {1..100}; do
     [[ -s "$log" ]] && break
     sleep 0.1

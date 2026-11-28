@@ -29,8 +29,11 @@ mod replay {
         hold: Option<u8>,
     ) -> Result<(), String> {
         let rank_tune = matches!(phase, "rank-tune" | "rank-confirm");
-        let hot = rank_tune || matches!(phase, "hot" | "hot-confirm" | "simd" | "simd-confirm");
+        let selection = phase == "selection" || phase == "selection-confirm";
+        let hot = selection || rank_tune || matches!(phase, "hot" | "hot-confirm" | "simd" | "simd-confirm");
         let (masks, blocks, seed): (Vec<u8>, u32, u8) = match (phase, hold) {
+            ("selection", _) => (vec![0, 1], 64, 49),
+            ("selection-confirm", _) => (vec![0, 1], 96, 219),
             ("hot", _) => ((0..8).map(|factors| 3 | (factors << 3)).collect(), 64, 73),
             ("hot-confirm", _) => (vec![3, 11, 19, 27], 128, 149),
             ("simd", _) => (vec![11, 75, 139, 203], 64, 91),
@@ -48,7 +51,15 @@ mod replay {
         };
         let pipes: Vec<_> = masks
             .iter()
-            .map(|&m| if rank_tune { s.compile_rank_tuning(m) } else { s.compile_screen_variant(m) })
+            .map(|&m| {
+                if selection {
+                    s.compile_selection_replay(m == 1)
+                } else if rank_tune {
+                    s.compile_rank_tuning(m)
+                } else {
+                    s.compile_screen_variant(m)
+                }
+            })
             .collect::<Result<_, _>>()?;
         let header = [0xb4; 80];
         let mut easy = [0xff; 32];
@@ -58,7 +69,7 @@ mod replay {
         let mut boundary_baseline = None;
         for pipe in &pipes {
             s.use_screen_variant(pipe)?;
-            if phase.starts_with("simd") || rank_tune {
+            if phase.starts_with("simd") || rank_tune || selection {
                 let mut boundary = Vec::new();
                 for count in [1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4096] {
                     let mut r = s.screen_range(&header, u32::MAX - (count - 1), count, &[0xff; 32], 2, false)?;
@@ -129,8 +140,9 @@ mod replay {
                 let mut hits = vec![];
                 let mut gpu = 0.;
                 let t = Instant::now();
-                for off in (0..count).step_by(REPLAY_BATCH as usize) {
-                    let r = s.screen_range(&h, block * count + off, REPLAY_BATCH, &bound, 2, false)?;
+                let batch = if selection { neb_gpuminer::metal_scanner::MINING_SCREEN_CAP } else { REPLAY_BATCH };
+                for off in (0..count).step_by(batch as usize) {
+                    let r = s.screen_range(&h, block * count + off, batch, &bound, 2, false)?;
                     evaluated += r.evaluated;
                     hits.extend(r.hits);
                     gpu += r.gpu_s;
@@ -193,7 +205,17 @@ mod replay {
         let upload = args.len() == 3 && args[2] == "lookup-upload";
         let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
         let hot = args.get(2).is_some_and(|m| {
-            matches!(m.as_str(), "hot" | "hot-confirm" | "simd" | "simd-confirm" | "rank-tune" | "rank-confirm")
+            matches!(
+                m.as_str(),
+                "selection"
+                    | "selection-confirm"
+                    | "hot"
+                    | "hot-confirm"
+                    | "simd"
+                    | "simd-confirm"
+                    | "rank-tune"
+                    | "rank-confirm"
+            )
         }) && args.len() == 3;
         let hold = if variants && args.len() == 4 {
             let id = args[3].parse::<u8>().map_err(|_| "bad mask")?;
@@ -206,7 +228,7 @@ mod replay {
         };
         if args.len() != 2 && !dispatch && !variants && !upload && !hot {
             return Err(
-                "DATASET SNAPSHOT_DIR [dispatch | feed | feed-confirm | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm | rank-tune | rank-confirm]".into(),
+                "DATASET SNAPSHOT_DIR [dispatch | feed | feed-confirm | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm | rank-tune | rank-confirm | selection | selection-confirm]".into(),
             );
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();

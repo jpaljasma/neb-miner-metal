@@ -74,6 +74,11 @@ async def miner_log(proc, monitor):
         sample = re.fullmatch(r"(\d+) attempts/s, shares (\d+), accepted blocks (\d+), mismatches (\d+), fallbacks (\d+), attempts (\d+)", msg)
         final = re.fullmatch(r"final attempts (\d+), mismatches (\d+), fallbacks (\d+)", msg)
         slot = re.fullmatch(r"slot (sample|final) (\d+) evaluated (\d+) screened (\d+) work_ns (\d+)", msg)
+        sky = re.fullmatch(r"sky search: (\d+) light curves in (\d+) batches, (\d+) refused, (\d+) failed requests", msg)
+        if sky:
+            curves, batches, refused, errors = map(int, sky.groups())
+            monitor.event("sky_sample", curves=curves, batches=batches, refused=refused, errors=errors)
+            continue
         if slot:
             kind, i, evaluated, screened, ns = slot.groups()
             monitor.event("slot_"+kind, slot=int(i), evaluated=int(evaluated),screened=int(screened),work_ns=int(ns))
@@ -405,6 +410,15 @@ async def open_pool(endpoint):
     return await asyncio.wait_for(asyncio.open_connection(url.hostname, url.port, limit=262144, **options), 12)
 
 
+def sky_flags(args):
+    flags = []
+    for key in ("sky", "sky_threads", "sky_address", "sky_device"):
+        value = getattr(args, key)
+        if value is not None:
+            flags.extend(("--" + key.replace("_", "-"), str(value)))
+    return flags
+
+
 async def run(args, monitor):
     login = args.address_file.read_text().strip()
     if not re.fullmatch(r"neb1[a-z0-9]{58}", login):
@@ -432,7 +446,7 @@ async def run(args, monitor):
             port = server.sockets[0].getsockname()[1]
             proc = await asyncio.create_subprocess_exec(str(args.miner), "--dataset", str(args.dataset),
                 *(["--stratum-adapter"] if args.selective else []), *(["--tess-ahead"] if args.tess_ahead else []),
-                "--node", f"127.0.0.1:{port}", stderr=asyncio.subprocess.PIPE,
+                *sky_flags(args), "--node", f"127.0.0.1:{port}", stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE if args.tess_ahead else None)
             monitor.event("miner_started", pid=proc.pid)
             log_reader = asyncio.create_task(miner_log(proc, monitor))
@@ -529,7 +543,15 @@ if __name__ == "__main__":
     parser.add_argument("--address-file", type=Path, default=ROOT / ".neb-payout-address")
     parser.add_argument("--dataset", type=Path, default=ROOT / "build/neb-datasets.bin")
     parser.add_argument("--miner", type=Path, default=ROOT / "node/target/release/neb-miner-metal")
+    parser.add_argument("--sky", help="opt in to the upstream CPU sky search at http://HOST:PORT")
+    parser.add_argument("--sky-threads", type=int, help="CPU search threads (default: one)")
+    parser.add_argument("--sky-address", help="optional address to send to the sky server")
+    parser.add_argument("--sky-device", help="optional device label to send to the sky server")
     args = parser.parse_args()
+    if args.sky_threads is not None and args.sky_threads < 1:
+        parser.error("--sky-threads must be positive")
+    if args.sky is not None and not args.sky.startswith("http://"):
+        parser.error("--sky requires an http:// URL")
     if args.tess_ahead and not args.selective:
         parser.error("--tess-ahead requires --selective")
     if args.worker and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", args.worker):
@@ -537,7 +559,8 @@ if __name__ == "__main__":
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("duration must be positive")
     monitor = Monitor(args)
-    monitor.event("start", worker=args.worker, duration_s=args.duration)
+    monitor.event("start", worker=args.worker, duration_s=args.duration,
+                  sky_threads=(args.sky_threads or 1) if args.sky else 0)
     outcome = "failed"
     try:
         watchdog = args.timeout if not args.duration else args.duration + 60 + (3600 if args.pause_file else 0)

@@ -15,6 +15,8 @@ On a 32-core M1 Max with 64 GB of unified memory, neb-miner-metal scanned **146.
 
 The two miners make different tradeoffs. This backend spent 306 ms on Kepler and 164 ms on TESS building lookup tables before scanning. Pramonoutomo’s implementation loaded each model in 0.003 ms and computed gradients during the scan. Its public Metal proposal made this same-Mac comparison possible. [Benchmark and replay commands](docs/metal-benchmark.md#matched-metal-scan-on-november-27-2026) · [Upstream Metal proposal](https://github.com/SilasEigen/neb/pull/2)
 
+The trained-model screen can stop the last ChaCha8 round as soon as a nonce has too many live rows for the pair table. In ten-second settled Kepler replays, the M1 Max completed **2.1–4.2% more tickets** across three recorded models. [GPU comparisons and methods](docs/metal-pool-tuning.md#suprminer-1963-and-intel-arc)
+
 ## Pool mining on M1 Max
 
 In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s** and TESS averaged **93.30 MH/s**. Each rate counts completed tickets over the time the pool assigned that model, including setup. Suprnova accepted 59 of 59 Kepler shares and 19 of 20 TESS shares. One TESS share went stale at a job change. [Pool tests and tuning](docs/metal-pool-tuning.md)
@@ -48,4 +50,16 @@ With Python 3 installed, save your NEB payout address in `.neb-payout-address` a
 
 The launcher opens a 24-hour pool worker and its dashboard in separate Terminal windows. Press **q** to close the dashboard. Press **Control-C** in the worker window to stop mining.
 
-Based on [SilasEigen/neb v1.0.9](https://github.com/SilasEigen/neb/tree/v1.0.9). [Apache-2.0 license](LICENSE)
+The dashboard shows device-wide GPU load and miner-process CPU load below it (100% CPU is one core). Pool difficulty uses K, M, G and T, with G denoting one billion. Each model’s work time shows days, hours, minutes and seconds as needed.
+
+## Optional TESS sky search
+
+The Metal miner includes the CPU sky-search client from NEB v1.0.11. On a fresh pool launch, pass the upstream server URL to enable it alongside mining:
+
+```sh
+./start-neb.command --sky http://sky.neuralenginebyte.org --sky-threads 1
+```
+
+The same flags work on `neb-miner-metal --node HOST:PORT` and the Stratum adapter. Mining alone is the default. Sky search starts with one CPU thread unless you set `--sky-threads N`. The dashboard shows whether search is enabled, its thread count and batch progress. The server receives the Metal device name by default. Use `--sky-device TEXT` to change it and `--sky-address ADDRESS` to send an optional address. The sky address defaults to empty independently of the pool payout address. [Upstream sky-search release](https://github.com/SilasEigen/neb/releases/tag/v1.0.11) · [Batch and result formats](spec/sky-search.md)
+
+The mining base is [SilasEigen/neb v1.0.9](https://github.com/SilasEigen/neb/tree/v1.0.9). [Apache-2.0 license](LICENSE)

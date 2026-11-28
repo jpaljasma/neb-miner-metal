@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Builds pow/gpu with nvcc (CUDA toolkit and, on Windows, the MSVC build tools) and the neb-miner-gpu binary.
 cuda = []
-metal = ["dep:metal", "dep:objc"]
+metal = ["dep:metal", "dep:objc", "dep:neb-sky"]
 metal-bench = ["metal"]
 
 [[bin]]
@@ -17,6 +17,7 @@ path = "src/metal_main.rs"
 required-features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
+neb-sky = { path = "../neb-sky", optional = true }
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
 

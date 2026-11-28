@@ -36,10 +36,11 @@ pub(super) enum RankLayout {
 pub(super) struct PairTuning {
     pub ranks: RankLayout,
     pub threads: u64,
+    pub deferred_diagonals: bool,
 }
 impl Default for PairTuning {
     fn default() -> Self {
-        Self { ranks: RankLayout::Plain, threads: SCREEN_GROUP_THREADS }
+        Self { ranks: RankLayout::Plain, threads: SCREEN_GROUP_THREADS, deferred_diagonals: false }
     }
 }
 
@@ -47,7 +48,7 @@ impl PairTuning {
     pub(super) fn production(compact_tickets: bool, rows: u32) -> Self {
         // With at most 16,384 rows, even two maximum ranks cannot carry into bit 15.
         let ranks = if compact_tickets && rows <= 16_384 { RankLayout::Tagged16 } else { RankLayout::Tagged32 };
-        Self { ranks, threads: SCREEN_GROUP_THREADS }
+        Self { ranks, threads: SCREEN_GROUP_THREADS, deferred_diagonals: true }
     }
 }
 impl RankLayout {
@@ -167,11 +168,12 @@ impl Screen {
     ) -> Result<ComputePipelineState, String> {
         let src = format!(
             concat!(
-                "#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n",
+                "#define DEFER_DIAGONALS {}\n#define CHECK_RECORDS {}\n#define SCALAR_CHACHA {}\n#define PAIRS_ONLY {}\n",
                 "#define HEADER_COLUMNS {}\n#define HIGH_WORD {}\n#define GROUP_ARGS {}\n",
                 "#define RANK_QUADS {}\n#define COMPACT_TICKETS {}\n#define SCREEN_GROUP_THREADS {}\n",
                 "#define RANK_LAYOUT {}\n#define RECOVER_THREE {}\n#define SUPPORT_WORDS {}\n{}",
             ),
+            u8::from(tuning.deferred_diagonals),
             u8::from(check),
             u8::from(mask & SCALAR_CHACHA != 0),
             u8::from(mask & PAIRS_ONLY != 0),
