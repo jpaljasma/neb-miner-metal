@@ -67,7 +67,7 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
                         uint tid [[thread_index_in_threadgroup]],
                         uint group [[threadgroup_position_in_grid]],
                         uint dispatched_width [[threads_per_threadgroup]]) {
-    const uint width = TWO_ROW ? GROUP_WIDTH : dispatched_width;
+    const uint width = (TWO_ROW || WIDE_LOAD) ? GROUP_WIDTH : dispatched_width;
     #if TWO_ROW && DIRECT_FACTORS
     #define PAIR(e) char2(as_type<char>(rows[OFFSET(0)+factor_offset+(e)]),as_type<char>(rows[OFFSET(1)+factor_offset+(e)]))
     #elif TWO_ROW
@@ -164,6 +164,20 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
     for (uint e = tid; e < factor_count; e += width)
         pair_factors[e]=char2(as_type<char>(rows[OFFSET(0)+factor_offset+e]),
                               as_type<char>(rows[OFFSET(1)+factor_offset+e]));
+    #elif WIDE_LOAD
+    // Each padded row has 836 readable factor bytes, including two padding bytes.
+    // Load four adjacent bytes per sample and transpose them into the dot-product lanes.
+    constexpr uint words = (factor_count + 3) / 4;
+    for (uint task=tid; task<4*words; task+=width) {
+        uint w=task/words, e=4*(task%words);
+        char4 v[4];
+        for (uint b=0;b<4;b++) {
+            uint sample=4*w+b;
+            v[b]=sample<samples ? *((device const char4 *)(rows+OFFSET(sample)+factor_offset+e)) : char4(0);
+        }
+        for(uint j=0;j<4;j++) if(e+j<factor_count)
+            FACTOR(e+j,w)=char4(v[0][j],v[1][j],v[2][j],v[3][j]);
+    }
     #elif !TWO_ROW
     for (uint e = tid; e < factor_count; e += width) {
         for (uint w = 0; w < 4; w++) {
@@ -253,11 +267,11 @@ kernel void kep1_digest(device const uchar *rows [[buffer(0)]],
             }
         }
     }
-    if (tid < 64) {
+    for (uint f=tid; f<64; f+=GROUP_WIDTH) {
         Mac4 products = 0;
         for (uint w = 0; w < 4; w++)
-            products += Mac4(FACTOR(800+tid/32,w)) * Mac4(FACTOR(802+tid%32,w));
-        sum += fold(products.x + products.y + products.z + products.w, 6, tid);
+            products += Mac4(FACTOR(800+f/32,w)) * Mac4(FACTOR(802+f%32,w));
+        sum += fold(products.x + products.y + products.z + products.w, 6, f);
     }
     #endif
     // The M1 Max has 32 lanes per SIMD group. Fold the four copies of each

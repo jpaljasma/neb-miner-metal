@@ -62,12 +62,12 @@ fn parts(arch: Arch) -> (Vec<Part>, usize) {
 }
 
 /// The per-sample gradients of one model state on one dataset.
-pub struct Table {
+pub struct Table<S = Vec<u8>> {
     arch: Arch,
     n: u32,
     parts: Vec<Part>,
     row: usize,
-    rows: Vec<u8>,
+    rows: S,
     /// Whether the gradient of the sample has a non-zero entry: a sample that the model already answers exactly adds
     /// nothing to an attempt.
     live: Vec<bool>,
@@ -99,22 +99,44 @@ impl Table {
         let n = dataset.n();
         spare.clear();
         spare.resize(row * n as usize, 0);
-        let mut live = vec![false; n as usize];
-        let chunk = (n as usize).div_ceil(threads.max(1)).max(1);
-        let result: Result<(), String> = std::thread::scope(|scope| {
-            let handles: Vec<_> = spare
-                .chunks_mut(row * chunk)
-                .zip(live.chunks_mut(chunk))
-                .enumerate()
-                .map(|(c, (rows, live))| {
-                    let parts = &parts;
-                    scope.spawn(move || fill(model, dataset, parts, row, (c * chunk) as u32, rows, live))
-                })
-                .collect();
-            handles.into_iter().try_for_each(|h| h.join().map_err(|_| "a table thread panicked".to_string())?)
-        });
-        result?;
+        let live = fill_rows(model, dataset, &parts, row, threads, &mut spare, None)?;
         Ok(Table { arch, n, parts, row, rows: spare, live })
+    }
+
+    /// Build directly into caller-owned storage. Bytes following each logical row are padding.
+    /// The returned view borrows the storage. When supplied, the n + 1 single-row
+    /// records are filled by the same workers, before their gradient scratch is reused.
+    pub fn build_into<'a>(
+        model: &Model,
+        dataset: &dyn Dataset,
+        threads: usize,
+        stride: usize,
+        storage: &'a mut [u8],
+        singles: Option<&mut [[u32; 9]]>,
+    ) -> Result<Table<&'a [u8]>, String> {
+        let arch = model.arch();
+        if arch == Arch::V1 || dataset.arch() != arch {
+            return Err("the table engine needs a v2 model and a dataset of its architecture".into());
+        }
+        let (parts, logical) = parts(arch);
+        let n = dataset.n();
+        if stride < logical || stride.checked_mul(n as usize) != Some(storage.len()) {
+            return Err("invalid gradient row stride or destination length".into());
+        }
+        let live = fill_rows(model, dataset, &parts, stride, threads, storage, singles)?;
+        Ok(Table { arch, n, parts, row: stride, rows: storage, live })
+    }
+
+    /// The rows, to build the next table in the same memory.
+    pub fn into_spare(self) -> Vec<u8> {
+        self.rows
+    }
+}
+
+impl<S: AsRef<[u8]> + Sync> Table<S> {
+    /// Transfer the live-row flags without copying them.
+    pub fn into_live_rows(self) -> Vec<bool> {
+        self.live
     }
 
     pub fn arch(&self) -> Arch {
@@ -129,11 +151,6 @@ impl Table {
     /// True for each dataset row with a nonzero gradient at the prepared weights.
     pub fn live_rows(&self) -> &[bool] {
         &self.live
-    }
-
-    /// The rows, to build the next table in the same memory.
-    pub fn into_spare(self) -> Vec<u8> {
-        self.rows
     }
 
     /// The attempt `key`: its digest, its ticket and its sample indices. `acc` is the scratch of the caller; after
@@ -189,7 +206,7 @@ impl Table {
             if !self.live[i as usize] {
                 continue;
             }
-            let row = &self.rows[i as usize * self.row..][..self.row];
+            let row = &self.rows.as_ref()[i as usize * self.row..][..self.row];
             for p in &self.parts {
                 let out = &mut acc[p.layer.offset..][..p.layer.weights];
                 let bytes = &row[p.at..][..part_bytes(p.kind, &p.layer)];
@@ -219,24 +236,77 @@ impl Table {
                 }
             }
         }
-        // clip, then the digest of spec/shares.md section 5.3 over the layers l = 1 .. L
-        let mut lanes = [0u32; 8];
-        for (l, p) in self.parts.iter().enumerate() {
-            let base = 7919 * (l as u32 + 1);
-            let layer = &mut acc[p.layer.offset..][..p.layer.weights];
-            for (j, chunk) in layer.chunks_mut(8).enumerate() {
-                for (k, v) in chunk.iter_mut().enumerate() {
-                    *v = (*v).clamp(-CLIP, CLIP);
-                    lanes[k] = lanes[k].wrapping_add((*v as u32) ^ (base + (8 * j + k) as u32));
-                }
-            }
-        }
+        let lanes = clip_digest(&self.parts, acc);
         let mut digest = [0u8; 32];
         for (k, lane) in lanes.iter().enumerate() {
             digest[4 * k..4 * k + 4].copy_from_slice(&lane.to_le_bytes());
         }
         digest
     }
+}
+
+fn clip_digest(parts: &[Part], acc: &mut [i32]) -> [u32; 8] {
+    // clip, then the digest of spec/shares.md section 5.3 over the layers l = 1 .. L
+    let mut lanes = [0u32; 8];
+    for (l, p) in parts.iter().enumerate() {
+        let base = 7919 * (l as u32 + 1);
+        let layer = &mut acc[p.layer.offset..][..p.layer.weights];
+        for (j, chunk) in layer.chunks_mut(8).enumerate() {
+            for (k, v) in chunk.iter_mut().enumerate() {
+                *v = (*v).clamp(-CLIP, CLIP);
+                lanes[k] = lanes[k].wrapping_add((*v as u32) ^ (base + (8 * j + k) as u32));
+            }
+        }
+    }
+    lanes
+}
+
+fn fill_rows(
+    model: &Model,
+    dataset: &dyn Dataset,
+    parts: &[Part],
+    row: usize,
+    threads: usize,
+    storage: &mut [u8],
+    singles: Option<&mut [[u32; 9]]>,
+) -> Result<Vec<bool>, String> {
+    let n = dataset.n();
+    let mut live = vec![false; n as usize];
+    let chunk = (n as usize).div_ceil(threads.max(1)).max(1);
+    let mut output = if let Some(entries) = singles {
+        if entries.len() != n as usize + 1 {
+            return Err("invalid single-row lookup length".into());
+        }
+        entries[0][0] = 0;
+        // With a zero gradient, each lane sums its arithmetic progression of salts.
+        for (k, lane) in entries[0][1..].iter_mut().enumerate() {
+            *lane = parts
+                .iter()
+                .enumerate()
+                .map(|(l, p)| {
+                    let terms = p.layer.weights.saturating_sub(k).div_ceil(8) as u64;
+                    (terms * (7919 * (l + 1) + k) as u64 + 4 * terms * terms.saturating_sub(1)) as u32
+                })
+                .fold(0u32, u32::wrapping_add);
+        }
+        Some(entries[1..].chunks_mut(chunk))
+    } else {
+        None
+    };
+    let result: Result<(), String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = storage
+            .chunks_mut(row * chunk)
+            .zip(live.chunks_mut(chunk))
+            .enumerate()
+            .map(|(c, (rows, live))| {
+                let singles = output.as_mut().map(|chunks| chunks.next().unwrap());
+                scope.spawn(move || fill(model, dataset, parts, row, (c * chunk) as u32, rows, (live, singles)))
+            })
+            .collect();
+        handles.into_iter().try_for_each(|h| h.join().map_err(|_| "a table thread panicked".to_string())?)
+    });
+    result?;
+    Ok(live)
 }
 
 /// Fills the rows of the samples `first ..`, one per entry of `live`.
@@ -247,7 +317,7 @@ fn fill(
     row: usize,
     first: u32,
     rows: &mut [u8],
-    live: &mut [bool],
+    (live, mut singles): (&mut [bool], Option<&mut [[u32; 9]]>),
 ) -> Result<(), String> {
     let arch = model.arch();
     let mut x = vec![0u8; arch.nin()];
@@ -280,6 +350,13 @@ fn fill(
                     }
                     f += len;
                 }
+            }
+        }
+        if let Some(entries) = singles.as_deref_mut() {
+            entries[i] = [0; 9];
+            if *live {
+                entries[i][0] = 1;
+                entries[i][1..].copy_from_slice(&clip_digest(parts, &mut g));
             }
         }
     }

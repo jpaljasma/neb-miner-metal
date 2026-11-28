@@ -9,6 +9,7 @@ use neb_block::Target;
 use neb_engines::table::Table;
 use neb_pow::shares::{Arch, Model, SharedDataset, share_indices};
 use objc::{msg_send, rc::autoreleasepool, sel, sel_impl};
+use std::borrow::Cow;
 
 use crate::Scanner;
 #[path = "metal_ahead.rs"]
@@ -21,14 +22,13 @@ mod metal_screen;
 #[cfg(feature = "metal-bench")]
 #[path = "metal_turnover_bench.rs"]
 mod metal_turnover_bench;
-pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, ScreenResult};
+pub use metal_screen::{MINING_SCREEN_CAP, PROBE_CAP, SCREEN_CAP, SETTLED_SCREEN_CAP, ScreenResult};
 #[cfg(feature = "metal-bench")]
 pub struct PairScreenVariant {
     pipeline: ComputePipelineState,
     mode: u8,
     tuning: metal_screen::PairTuning,
 }
-const SCREEN_BATCH_SCALE: u64 = (MINING_SCREEN_CAP / SCREEN_CAP) as u64;
 
 const BATCH: usize = 16384;
 const DISPATCH: usize = 2048;
@@ -43,6 +43,18 @@ const DEFAULT_VARIANT: u8 = 4 | 8 | 16;
 
 fn pipeline(device: &Device, mask: u8) -> Result<(ComputePipelineState, u64), String> {
     table_pipeline(device, mask, 0, 0)
+}
+
+fn compact_exhaustive(device: &Device) -> Result<(ComputePipelineState, u64), String> {
+    table_pipeline_geometry(
+        device,
+        DEFAULT_VARIANT | 64 | 128,
+        0,
+        0,
+        PairBuilder::General,
+        256,
+        FactorAccess::VectorStaged,
+    )
 }
 
 fn table_pipeline(device: &Device, mask: u8, build: u8, read: u8) -> Result<(ComputePipelineState, u64), String> {
@@ -67,6 +79,15 @@ impl PairBuilder {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FactorAccess {
+    Staged,
+    Direct,
+    #[cfg(feature = "metal-bench")]
+    InputFirst,
+    VectorStaged,
+}
+
 fn table_pipeline_options(
     device: &Device,
     mask: u8,
@@ -79,7 +100,8 @@ fn table_pipeline_options(
         _ if mask & 16 == 0 => 128,
         _ => 256,
     };
-    let direct = u8::from(pair_style == PairBuilder::DirectMaskedTwoRows);
+    let direct =
+        if pair_style == PairBuilder::DirectMaskedTwoRows { FactorAccess::Direct } else { FactorAccess::Staged };
     table_pipeline_geometry(device, mask, build, read, pair_style, width, direct)
 }
 fn table_pipeline_geometry(
@@ -89,10 +111,17 @@ fn table_pipeline_geometry(
     read: u8,
     pair_style: PairBuilder,
     width: u64,
-    access: u8,
+    access: FactorAccess,
 ) -> Result<(ComputePipelineState, u64), String> {
+    let wide = u8::from(matches!(access, FactorAccess::VectorStaged));
+    let access = match access {
+        FactorAccess::Direct => 1,
+        #[cfg(feature = "metal-bench")]
+        FactorAccess::InputFirst => 2,
+        _ => 0,
+    };
     let source = format!(
-        "#define ROW_CACHE {}\n#define PLANAR {}\n#define SHORT_MAC {}\n#define SALT_BASE {}\n#define SINGLE_CACHE {}\n#define COMPACT_ROWS {}\n#define SHORT_DOT {}\n#define COMBO_BUILD {build}\n#define COMBO_READ {read}\n#define GROUP_WIDTH {width}\n{SHADER}",
+        "#define WIDE_LOAD {wide}\n#define ROW_CACHE {}\n#define PLANAR {}\n#define SHORT_MAC {}\n#define SALT_BASE {}\n#define SINGLE_CACHE {}\n#define COMPACT_ROWS {}\n#define SHORT_DOT {}\n#define COMBO_BUILD {build}\n#define COMBO_READ {read}\n#define GROUP_WIDTH {width}\n{SHADER}",
         mask & 1,
         (mask >> 1) & 1,
         (mask >> 2) & 1,
@@ -140,7 +169,11 @@ fn shared_buffer(device: &metal::DeviceRef, len: usize) -> Result<Buffer, String
     Ok(buffer)
 }
 
-fn mapped_single_lookup(device: &Device, table: &Table, threads: usize) -> Result<Buffer, String> {
+fn mapped_single_lookup(
+    device: &Device,
+    table: &Table<impl AsRef<[u8]> + Sync>,
+    threads: usize,
+) -> Result<Buffer, String> {
     let count = table.live_rows().len() + 1;
     let storage = shared_buffer(device, count * size_of::<[u32; 9]>())?;
     // SAFETY: newBufferWithLength zero-initializes this aligned, count-record mapping.
@@ -336,6 +369,12 @@ fn finish_tickets(platform: blake3::platform::Platform, keys: &mut [[u8; 32]], d
     }
 }
 
+type Pipeline = (ComputePipelineState, u64);
+struct PreloadedScreen {
+    screen: metal_screen::Screen,
+    style: PairBuilder,
+    fresh_pairs: Pipeline,
+}
 pub struct MetalScanner {
     recover_triples: bool,
     skip_unchanged: bool,
@@ -350,6 +389,7 @@ pub struct MetalScanner {
     width: u64,
     dispatch_size: usize,
     host_mask: u8,
+    wide_exhaustive: bool,
     allow_screen: bool,
     compact_tickets: bool,
     ahead: Option<TessAhead>,
@@ -358,12 +398,15 @@ pub struct MetalScanner {
     reuse_hint: Option<PairReuse>,
     use_screen: bool,
     retry_screen: Option<RetryScreen>,
-    screen_batches: u64,
+    screened_since_audit: u64,
     #[cfg(feature = "metal-bench")]
     gpu_seconds: f64,
     screen: Option<metal_screen::Screen>,
+    preload: Option<std::thread::JoinHandle<Result<PreloadedScreen, String>>>,
+    pair_pipelines: [Option<(PairBuilder, Pipeline)>; 2],
     dataset: SharedDataset,
     rows: Option<ModelRows>,
+    spare_rows: Option<Buffer>,
     indices: Buffer,
     digests: Buffer,
     keys: Vec<[u8; 32]>,
@@ -415,6 +458,7 @@ impl MetalScanner {
             width,
             dispatch_size: DISPATCH,
             host_mask: 0,
+            wide_exhaustive: false,
             allow_screen: false,
             compact_tickets: false,
             ahead: None,
@@ -423,15 +467,18 @@ impl MetalScanner {
             reuse_hint: None,
             use_screen: false,
             retry_screen: None,
-            screen_batches: 0,
+            screened_since_audit: 0,
             dataset,
             rows: None,
+            spare_rows: None,
             indices,
             digests,
             keys: vec![[0; 32]; BATCH],
             #[cfg(feature = "metal-bench")]
             gpu_seconds: 0.0,
             screen: None,
+            preload: None,
+            pair_pipelines: [None, None],
         })
     }
 
@@ -561,6 +608,37 @@ impl MetalScanner {
 impl MetalScanner {
     pub fn enable_screen(&mut self) {
         self.allow_screen = true;
+        if self.screen.is_none() && self.preload.is_none() {
+            let device = self.device.clone();
+            let compact = self.compact_tickets;
+            let count = self.dataset.n();
+            let style = self.pair_style;
+            // This thread only prepares immutable pipelines and private buffers. The
+            // work-service reader and gradient workers can receive and build the job concurrently.
+            self.preload = std::thread::Builder::new()
+                .name("metal-preload".into())
+                .spawn(move || {
+                    autoreleasepool(|| {
+                        let screen = metal_screen::Screen::new(&device, compact, count)?;
+                        let fresh_pairs = table_pipeline_options(&device, DEFAULT_VARIANT | 64 | 128, 2, 0, style)?;
+                        Ok(PreloadedScreen { screen, style, fresh_pairs })
+                    })
+                })
+                .ok();
+        }
+    }
+    fn finish_preload(&mut self) {
+        if let Some(loader) = self.preload.take() {
+            match loader.join() {
+                Ok(Ok(ready)) => {
+                    self.screen = Some(ready.screen);
+                    self.pair_pipelines[0] = Some((ready.style, ready.fresh_pairs));
+                }
+                // Retry lazily through the normal fallible constructors.
+                Ok(Err(e)) => eprintln!("Metal preload failed: {e}"),
+                Err(_) => eprintln!("Metal preload thread panicked"),
+            }
+        }
     }
     pub fn enable_tess_ahead(&mut self) -> TessAhead {
         let ahead = TessAhead::new(self.dataset.clone());
@@ -654,7 +732,7 @@ impl MetalScanner {
             "model trial full {:.0} attempts/s, predicted pair {:.0} attempts/s, build {:.2}s, selected {}",
             full, expected, build_s, keep
         );
-        self.screen_batches = 0;
+        self.screened_since_audit = 0;
         Ok(keep)
     }
 
@@ -722,7 +800,7 @@ impl MetalScanner {
         arity: u8,
         check: bool,
     ) -> Result<ScreenResult, String> {
-        self.run_screen(header, start, count, bound, arity, check, false)
+        self.run_screen(header, start, count, bound, arity, check, false).map(ScreenResult::into_owned)
     }
 
     fn productive_range(
@@ -731,7 +809,7 @@ impl MetalScanner {
         start: u32,
         count: u32,
         bound: &[u8; 32],
-    ) -> Result<ScreenResult, String> {
+    ) -> Result<ScreenResult<&[u32]>, String> {
         self.run_screen(header, start, count, bound, 2, false, self.recover_triples)
     }
 
@@ -745,7 +823,8 @@ impl MetalScanner {
         arity: u8,
         check: bool,
         recover: bool,
-    ) -> Result<ScreenResult, String> {
+    ) -> Result<ScreenResult<&[u32]>, String> {
+        self.finish_preload();
         let screen = match &mut self.screen {
             Some(screen) => screen,
             empty @ None => {
@@ -774,6 +853,7 @@ impl MetalScanner {
         self.prepare_combos(triple_mib, false)
     }
     fn prepare_combos(&mut self, triple_mib: usize, progressive: bool) -> Result<(), String> {
+        self.finish_preload();
         let rows = self.rows.as_mut().ok_or("missing model rows")?;
         let n = rows.live.iter().filter(|&&live| live).count();
         let mut pairs = n * (n + 1) / 2;
@@ -807,8 +887,16 @@ impl MetalScanner {
         let values = shared_buffer(&self.device, bytes.max(32))?;
         let reuse = self.reuse_hint.take();
         let build_kind = if reuse.is_some() { 4 } else { 2 };
-        let pair_builder =
-            table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0, self.pair_style)?;
+        let cached = &mut self.pair_pipelines[usize::from(reuse.is_some())];
+        let pair_builder = match cached {
+            Some((style, pipeline)) if *style == self.pair_style => pipeline.clone(),
+            entry => {
+                let p =
+                    table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, build_kind, 0, self.pair_style)?;
+                *entry = Some((self.pair_style, p.clone()));
+                p
+            }
+        };
         let (active_outputs, support) =
             turnover_tables(&self.device, rows, ids, self.pair_style.uses_output_mask(), self.recover_triples)?;
         rows.combos = Some(Combos {
@@ -832,13 +920,11 @@ impl MetalScanner {
             if count == 0 {
                 continue;
             }
-            let p = table_pipeline_options(
-                &self.device,
-                DEFAULT_VARIANT | 64 | 128,
-                if arity == 2 { build_kind } else { arity },
-                0,
-                if arity == 2 { self.pair_style } else { PairBuilder::General },
-            )?;
+            let p = if arity == 2 {
+                combos.pair_builder.clone()
+            } else {
+                table_pipeline_options(&self.device, DEFAULT_VARIANT | 64 | 128, arity, 0, PairBuilder::General)?
+            };
             let start = std::time::Instant::now();
             for first in (0..count).step_by(32768) {
                 combos.slice(&self.queue, &rows.buffer, &p, offset, first, (count - first).min(32768), limit)?;
@@ -897,11 +983,15 @@ impl MetalScanner {
         Ok(PairScreenVariant { pipeline, mode, tuning })
     }
     pub fn use_screen_variant(&mut self, variant: &PairScreenVariant) -> Result<(), String> {
+        self.finish_preload();
         if self.screen.is_none() {
             self.screen = Some(metal_screen::Screen::new(&self.device, self.compact_tickets, self.dataset.n())?);
         }
         self.screen.as_mut().unwrap().set_pair_pipeline(variant.pipeline.clone(), variant.mode, variant.tuning);
         Ok(())
+    }
+    pub fn compile_compact_exhaustive(&self) -> Result<(ComputePipelineState, u64), String> {
+        compact_exhaustive(&self.device)
     }
     pub fn compile_variant(&self, mask: u8) -> Result<(ComputePipelineState, u64), String> {
         pipeline(&self.device, mask)
@@ -933,11 +1023,19 @@ impl MetalScanner {
 }
 
 impl Scanner for MetalScanner {
+    fn matches_ticket(&mut self, header: &[u8; 80], nonce: u32, reference: &[u8; 32]) -> Result<bool, String> {
+        Ok(self.tickets(header, nonce, 1)?[0] == *reference)
+    }
+
     fn mining_mode(&self) -> Option<&'static str> {
         Some(if self.use_screen { "selective" } else { "exhaustive" })
     }
     fn mining_capacity(&self) -> u32 {
-        if self.use_screen { MINING_SCREEN_CAP } else { self.capacity() }
+        if !self.use_screen {
+            return self.capacity();
+        }
+        let c = self.rows.as_ref().unwrap().combos.as_ref().unwrap();
+        if c.args[0] == c.args[2] { SETTLED_SCREEN_CAP } else { MINING_SCREEN_CAP }
     }
     fn request_roll(&self) -> bool {
         self.allow_screen
@@ -950,30 +1048,42 @@ impl Scanner for MetalScanner {
         count: u32,
         bound: &[u8; 32],
     ) -> Result<(Vec<u32>, u32), String> {
+        let (hits, evaluated) = self.mine_range_view(model, header, start, count, bound)?;
+        Ok((hits.into_owned(), evaluated))
+    }
+    fn mine_range_view(
+        &mut self,
+        model: &Model,
+        header: &[u8; 80],
+        start: u32,
+        count: u32,
+        bound: &[u8; 32],
+    ) -> Result<(Cow<'_, [u32]>, u32), String> {
         if !self.use_screen {
             if self.retry_screen.is_none() {
-                return Ok((self.scan(header, start, count, bound)?, count));
+                return Ok((Cow::Owned(self.scan(header, start, count, bound)?), count));
             }
             let t = std::time::Instant::now();
             let hits = self.scan(header, start, count, bound)?;
             self.retry_after_full_batch(model, header, start, count, t.elapsed().as_secs_f64())?;
-            return Ok((hits, count));
+            return Ok((Cow::Owned(hits), count));
         }
         let rows = self.rows.as_mut().unwrap();
         rows.combos.as_mut().unwrap().advance(&self.queue, &rows.buffer)?;
-        self.screen_batches += 1;
-        if self.screen_batches.is_multiple_of(512 / SCREEN_BATCH_SCALE) {
+        self.screened_since_audit += u64::from(count);
+        if self.screened_since_audit >= 512 * u64::from(SCREEN_CAP) {
+            self.screened_since_audit %= 512 * u64::from(SCREEN_CAP);
             self.audit_screen(model, header, start, count.min(16))?;
         }
         let result = self.productive_range(header, start, count, bound)?;
-        Ok((result.hits, result.evaluated))
+        Ok((Cow::Borrowed(result.hits), result.evaluated))
     }
     fn capacity(&self) -> u32 {
         self.keys.len() as u32
     }
     fn audit_batches(&self) -> u64 {
         if self.use_screen {
-            crate::AUDIT_BATCHES / SCREEN_BATCH_SCALE
+            crate::AUDIT_BATCHES / u64::from(self.mining_capacity() / SCREEN_CAP)
         } else {
             (crate::AUDIT_BATCHES * 4096 / u64::from(self.capacity())).max(1)
         }
@@ -995,53 +1105,81 @@ impl Scanner for MetalScanner {
             return Ok(());
         }
         let threads = self.build_threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        let table = Table::build(model, &*self.dataset, threads, vec![])?;
+        let n = self.dataset.n() as usize;
+        let len = STRIDE * n;
+        // The skipped-copy benchmark keeps its old staging path. Normal mining writes
+        // directly into the next shared buffer while the previous rows remain available for exact reuse checks.
+        let next = if self.skip_unchanged {
+            None
+        } else {
+            Some(match self.spare_rows.take() {
+                Some(buffer) => buffer,
+                None => shared_buffer(&self.device, len)?,
+            })
+        };
+        let mut staged;
+        let (stride, data) = if let Some(buffer) = &next {
+            // SAFETY: the spare buffer is exclusive, sized for this scanner's immutable dataset,
+            // and every command referencing it completed before it became spare.
+            (STRIDE, unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>(), len) })
+        } else {
+            staged = vec![0; ROW * n];
+            (ROW, staged.as_mut_slice())
+        };
+        // A compact previous model predicts that the next model will also use single-row
+        // lookups. On a cold start or a density change, the existing lazy builder is available.
+        let expect_singles = cfg!(feature = "metal-bench")
+            || self.host_mask & 4 != 0
+            || (self.allow_screen && self.host_mask & 8 != 0 && !self.wide_exhaustive);
+        let precomputed =
+            expect_singles.then(|| shared_buffer(&self.device, (n + 1) * size_of::<[u32; 9]>())).transpose()?;
+        let entries = precomputed.as_ref().map(|b| {
+            // SAFETY: a fresh, exclusive shared mapping of exactly n + 1 aligned records.
+            unsafe { std::slice::from_raw_parts_mut(b.contents().cast::<[u32; 9]>(), n + 1) }
+        });
+        let table = Table::build_into(model, &*self.dataset, threads, stride, data, entries)?;
+        let idle = table.idle_rows();
+        let sparse = idle * 2 >= n;
         if !cfg!(feature = "metal-bench") || self.allow_screen {
-            // The trained fixtures were 65–77% idle. Use the compact scanner
-            // only on sparse models; dense jobs keep the full-width kernel.
-            let compact = table.idle_rows() * 2 >= self.dataset.n() as usize;
-            if compact != (self.host_mask & 8 != 0) {
-                let mode = DEFAULT_VARIANT | if compact { 64 | 128 } else { 0 };
-                (self.pipeline, self.width) = pipeline(&self.device, mode)?;
+            // The pair screen and exhaustive row compaction have different break-even points.
+            let wide = !sparse && idle * 4 >= n;
+            let compact = sparse || wide;
+            if compact != (self.host_mask & 8 != 0) || wide != self.wide_exhaustive {
+                (self.pipeline, self.width) = if wide {
+                    compact_exhaustive(&self.device)?
+                } else {
+                    pipeline(&self.device, DEFAULT_VARIANT | if compact { 64 | 128 } else { 0 })?
+                };
                 self.host_mask = if compact { 8 | 32 } else { 0 };
+                self.wide_exhaustive = wide;
             }
         }
-        let try_screen = self.allow_screen && table.idle_rows() * 2 >= self.dataset.n() as usize;
+        let try_screen = self.allow_screen && sparse;
         let singles = if cfg!(feature = "metal-bench") || try_screen || self.host_mask & 4 != 0 {
-            Some(mapped_single_lookup(&self.device, &table, threads)?)
+            Some(match precomputed {
+                Some(b) => b,
+                None => mapped_single_lookup(&self.device, &table, threads)?,
+            })
         } else {
             None
         };
         let live =
-            if cfg!(feature = "metal-bench") || self.host_mask & 8 != 0 { table.live_rows().to_vec() } else { vec![] };
-        let table = table.into_spare();
-        if table.len() != ROW * self.dataset.n() as usize {
-            return Err("unexpected KEP1 row layout".into());
-        }
-        let len = STRIDE * self.dataset.n() as usize;
-        let rows = match &mut self.rows {
-            Some(rows) => rows,
-            slot @ None => slot.insert(ModelRows {
-                buffer: shared_buffer(&self.device, len)?,
-                weights: Vec::new(),
-                singles: None,
-                live: vec![],
-                combos: None,
-            }),
-        };
-        // SAFETY: the slot's dataset fixes len for the lifetime of this shared
-        // buffer. All dispatches complete synchronously under exclusive access.
-        let out = unsafe { std::slice::from_raw_parts_mut(rows.buffer.contents().cast::<u8>(), len) };
-        self.reuse_hint = None;
+            if cfg!(feature = "metal-bench") || self.host_mask & 8 != 0 { table.into_live_rows() } else { vec![] };
         let mut remap = Vec::new();
+        self.reuse_hint = None;
         if self.allow_reuse
-            && let Some(old) = &rows.combos
+            && let Some(previous) = &self.rows
+            && let Some(old) = &previous.combos
         {
+            // SAFETY: the previous shared mapping is immutable until the old row buffer is replaced below.
+            let previous_data = unsafe { std::slice::from_raw_parts(previous.buffer.contents().cast::<u8>(), len) };
             let mut same = 0;
-            for (i, (dst, src)) in out.as_chunks::<STRIDE>().0.iter().zip(table.as_chunks::<ROW>().0).enumerate() {
+            for (i, (dst, src)) in
+                previous_data.as_chunks::<STRIDE>().0.iter().zip(data.chunks_exact(stride)).enumerate()
+            {
                 if live.get(i) == Some(&true) {
                     let rank = old.host_ranks[i];
-                    let unchanged = rank != u32::MAX && dst[..ROW] == src[..];
+                    let unchanged = rank != u32::MAX && dst[..ROW] == src[..ROW];
                     same += usize::from(unchanged);
                     remap.push(if unchanged { rank } else { u32::MAX });
                 }
@@ -1057,32 +1195,49 @@ impl Scanner for MetalScanner {
                 self.reuse_hint = Some(PairReuse { ranks, old_values: old.values.clone(), ready: old.args[0] });
             }
         }
-        let mut prior = remap.into_iter();
         #[cfg(feature = "metal-bench")]
         let copy_start = std::time::Instant::now();
         #[cfg(feature = "metal-bench")]
         {
             self.skipped_bytes = 0;
         }
-        for (i, (dst, src)) in out.as_chunks_mut::<STRIDE>().0.iter_mut().zip(table.as_chunks::<ROW>().0).enumerate() {
-            if self.skip_unchanged && live.get(i) == Some(&true) && prior.next().is_some_and(|r| r != u32::MAX) {
-                #[cfg(feature = "metal-bench")]
-                {
-                    self.skipped_bytes += ROW;
+        let buffer = if let Some(buffer) = next {
+            buffer
+        } else {
+            let dest = match &self.rows {
+                Some(r) => r.buffer.clone(),
+                None => shared_buffer(&self.device, len)?,
+            };
+            // SAFETY: all previous GPU readers have finished; the CPU staging storage is separate.
+            let out = unsafe { std::slice::from_raw_parts_mut(dest.contents().cast::<u8>(), len) };
+            let mut prior = remap.into_iter();
+            for (i, (dst, src)) in out.as_chunks_mut::<STRIDE>().0.iter_mut().zip(data.as_chunks::<ROW>().0).enumerate()
+            {
+                if live.get(i) == Some(&true) && prior.next().is_some_and(|r| r != u32::MAX) {
+                    #[cfg(feature = "metal-bench")]
+                    {
+                        self.skipped_bytes += ROW;
+                    }
+                } else {
+                    dst[..ROW].copy_from_slice(src);
                 }
-                continue;
             }
-            dst[..ROW].copy_from_slice(src);
-        }
-        rows.weights.clear();
+            dest
+        };
         #[cfg(feature = "metal-bench")]
         {
             self.copy_seconds = copy_start.elapsed().as_secs_f64();
         }
-        rows.weights.extend_from_slice(model.weights());
-        rows.singles = singles;
-        rows.live = live;
-        rows.combos = None;
+        let mut weights = Vec::new();
+        if let Some(old) = self.rows.take() {
+            weights = old.weights;
+            if !self.skip_unchanged {
+                self.spare_rows = Some(old.buffer);
+            }
+        }
+        weights.clear();
+        weights.extend_from_slice(model.weights());
+        self.rows = Some(ModelRows { buffer, weights, singles, live, combos: None });
         self.use_screen = false;
         self.retry_screen = None;
         if try_screen {

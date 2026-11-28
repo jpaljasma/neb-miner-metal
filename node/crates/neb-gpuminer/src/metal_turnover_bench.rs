@@ -21,7 +21,7 @@ impl MetalScanner {
         n: u32,
         bound: &[u8; 32],
     ) -> Result<ScreenResult, String> {
-        self.productive_range(h, start, n, bound)
+        self.productive_range(h, start, n, bound).map(ScreenResult::into_owned)
     }
     pub fn set_setup_threads(&mut self, threads: std::num::NonZeroUsize) {
         self.build_threads = Some(threads.get());
@@ -68,7 +68,7 @@ impl MetalScanner {
                         0,
                         PairBuilder::MaskedTwoRows,
                         [256, 128, 64, 32][id / 3],
-                        (id % 3) as u8,
+                        [FactorAccess::Staged, FactorAccess::Direct, FactorAccess::InputFirst][id % 3],
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?

@@ -54,7 +54,7 @@ mod bench {
         if args.len() == 3 && args[2] == "reuse" {
             return pair_reuse(&args[0], Path::new(&args[1]));
         }
-        let usage = "DATASET SNAPSHOT_DIR (screen|queue|host|compact) or (confirm|queue-confirm|host-confirm|compact-confirm) ID";
+        let usage = "DATASET SNAPSHOT_DIR (screen|queue|host|compact|exhaustive) or (confirm|queue-confirm|host-confirm|compact-confirm|exhaustive-confirm) ID";
         if args.len() < 3 {
             return Err(usage.into());
         }
@@ -65,6 +65,7 @@ mod bench {
             "screen" => (32, 0x450912, 0x76443a),
             "queue" => (SCHEDULES.len() as u8, 0xe5f103, 0xb18d21),
             "host" => (8, 0x3175b1, 0x964e96),
+            "exhaustive" => (2, 0x491012, 0x154023),
             "compact" => (6, 0xa18a44, 0xa9c045),
             "tables" => (4, 0x658de3, 0x1382ab),
             _ => return Err(usage.into()),
@@ -115,7 +116,13 @@ mod bench {
                 "queue" => 28,
                 _ => mask,
             };
-            let pipe = if family == "tables" && mask >= 2 {
+            let pipe = if family == "exhaustive" {
+                if mask == 0 {
+                    jobs[0].scanner.compile_variant(28)?
+                } else {
+                    jobs[0].scanner.compile_compact_exhaustive()?
+                }
+            } else if family == "tables" && mask >= 2 {
                 jobs[0].scanner.combo_pipeline(mask)?
             } else if family == "tables" {
                 jobs[0].scanner.compile_variant(28 | 64 | 128 | if mask == 1 { 32 } else { 0 })?
@@ -158,13 +165,20 @@ mod bench {
                     job.scanner.use_variant(pipe);
                     job.scanner.set_host_mask(match family {
                         "host" => mask,
+                        "exhaustive" => {
+                            if mask == 0 {
+                                0
+                            } else {
+                                8 | 32
+                            }
+                        }
                         "compact" => 8 * u8::from(mask % 3 != 0) + 32 * u8::from(mask >= 3),
                         "tables" => 8 | 32 | if mask > 0 { 4 } else { 0 } | if mask >= 2 { 64 } else { 0 },
                         _ => 0,
                     });
                     let (batch, dispatch) = match family {
                         "queue" => SCHEDULES[mask as usize],
-                        "host" | "compact" | "tables" => SCHEDULES[7],
+                        "host" | "compact" | "tables" | "exhaustive" => SCHEDULES[7],
                         _ => (BATCH, BATCH),
                     };
                     job.scanner.schedule(batch, dispatch)?;

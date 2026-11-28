@@ -200,7 +200,8 @@ mod replay {
 
     pub fn run() -> Result<(), String> {
         let args: Vec<_> = std::env::args().skip(1).collect();
-        let feed = args.len() == 3 && matches!(args[2].as_str(), "feed" | "feed-confirm");
+        let parallelism = args.len() == 3 && args[2] == "parallelism";
+        let feed = parallelism || (args.len() == 3 && matches!(args[2].as_str(), "feed" | "feed-confirm"));
         let dispatch = feed || (args.len() == 3 && args[2] == "dispatch");
         let upload = args.len() == 3 && args[2] == "lookup-upload";
         let variants = args.get(2).is_some_and(|m| m == "variants") && (3..=4).contains(&args.len());
@@ -228,7 +229,7 @@ mod replay {
         };
         if args.len() != 2 && !dispatch && !variants && !upload && !hot {
             return Err(
-                "DATASET SNAPSHOT_DIR [dispatch | feed | feed-confirm | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm | rank-tune | rank-confirm | selection | selection-confirm]".into(),
+                "DATASET SNAPSHOT_DIR [dispatch | feed | feed-confirm | parallelism | variants [HOLDOUT_MASK] | lookup-upload | hot | hot-confirm | simd | simd-confirm | rank-tune | rank-confirm | selection | selection-confirm]".into(),
             );
         }
         let pin = blake3::Hash::from_hex("790b57fbd830f3dcbe7de9d1146aa89a0a20799118e30dd48a343a5c98f19e72").unwrap();
@@ -264,8 +265,16 @@ mod replay {
                 continue;
             }
             if dispatch {
-                let total = if feed { 8 * REPLAY_BATCH } else { 4 * REPLAY_BATCH };
-                let (blocks, seed): (u32, u8) = if args[2] == "feed-confirm" {
+                let total = if parallelism {
+                    neb_gpuminer::metal_scanner::SETTLED_SCREEN_CAP
+                } else if feed {
+                    8 * REPLAY_BATCH
+                } else {
+                    4 * REPLAY_BATCH
+                };
+                let (blocks, seed): (u32, u8) = if parallelism {
+                    (64, 173)
+                } else if args[2] == "feed-confirm" {
                     (96, 217)
                 } else if feed {
                     (48, 137)
@@ -288,6 +297,7 @@ mod replay {
                     }
                     // Zero is the previous production kernel with its original batch.
                     let mut order = match (feed, confirm_pipelines.is_some()) {
+                        _ if parallelism => vec![total / 4, total / 2, total],
                         (true, true) => vec![0, REPLAY_BATCH, REPLAY_BATCH * 2, REPLAY_BATCH * 4],
                         (true, false) => vec![REPLAY_BATCH, REPLAY_BATCH * 2, REPLAY_BATCH * 4],
                         _ => vec![SCREEN_CAP, REPLAY_BATCH],

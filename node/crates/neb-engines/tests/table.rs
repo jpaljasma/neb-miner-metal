@@ -229,3 +229,27 @@ fn the_table_name_parses() {
     assert_eq!(EngineKind::parse("table"), Ok(EngineKind::Table));
     assert_eq!(EngineKind::Table.name(), "table");
 }
+
+#[test]
+fn mapped_rows_preserve_padding_and_match_the_owned_table_and_single_digests() {
+    for arch in ARCHS {
+        let ds = SyntheticDataset2::new(arch);
+        let model = initial(arch);
+        let n = ds.n() as usize;
+        let logical = Table::bytes(arch, 1);
+        let stride = logical + 3;
+        let reference = Table::build(&model, &ds, 3, Vec::new()).unwrap();
+        let mut storage = vec![0xc7; n * stride];
+        let mut singles = vec![[u32::MAX; 9]; n + 1];
+        let mapped = Table::build_into(&model, &ds, 7, stride, &mut storage, Some(&mut singles)).unwrap();
+        assert_eq!(mapped.live_rows(), reference.live_rows());
+        assert_eq!(mapped.eval(&[41; 32], &mut vec![]).ticket, reference.eval(&[41; 32], &mut vec![]).ticket);
+        assert_eq!(singles, reference.single_row_lookup(4));
+        for (mapped, original) in storage.chunks_exact(stride).zip(reference.into_spare().chunks_exact(logical)) {
+            assert_eq!(&mapped[..logical], original);
+            assert_eq!(&mapped[logical..], &[0xc7; 3]);
+        }
+        assert!(Table::build_into(&model, &ds, 1, logical - 1, &mut storage, None).is_err());
+        assert!(Table::build_into(&model, &ds, 1, stride, &mut storage, Some(&mut singles[1..])).is_err());
+    }
+}

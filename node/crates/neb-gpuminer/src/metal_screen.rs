@@ -6,6 +6,8 @@ use super::*;
 pub const SCREEN_CAP: u32 = 262144;
 /// Amortize one synchronous GPU submission across sixteen calibration ranges.
 pub const MINING_SCREEN_CAP: u32 = SCREEN_CAP * 16;
+/// With the pair table ready, amortize host submission over a larger range.
+pub const SETTLED_SCREEN_CAP: u32 = 4 * MINING_SCREEN_CAP;
 pub const PROBE_CAP: u32 = 4096;
 const SCALAR_CHACHA: u8 = 1;
 const PAIRS_ONLY: u8 = 2;
@@ -17,7 +19,7 @@ const RANK_QUADS: u8 = 64;
 const COMPACT_TICKETS: u8 = 128;
 const DEFAULT_SCREEN: u8 = PAIRS_ONLY | SCALAR_CHACHA | HEADER_COLUMNS | RANK_QUADS;
 const SCREEN_GROUP_THREADS: u64 = 128;
-type ScreenArgs = [u32; 40];
+type ScreenArgs = [u32; 41];
 
 pub(super) fn pair_mode(compact_tickets: bool) -> u8 {
     DEFAULT_SCREEN | if compact_tickets { COMPACT_TICKETS } else { 0 }
@@ -139,12 +141,23 @@ pub struct Screen {
     hits: Buffer,
     records: Buffer,
 }
-pub struct ScreenResult {
+pub struct ScreenResult<H = Vec<u32>> {
     #[cfg(feature = "metal-bench")]
     pub gpu_s: f64,
     pub evaluated: u32,
-    pub hits: Vec<u32>,
+    pub hits: H,
     pub records: Vec<[u32; 9]>,
+}
+impl ScreenResult<&[u32]> {
+    pub(super) fn into_owned(self) -> ScreenResult {
+        ScreenResult {
+            hits: self.hits.to_vec(),
+            evaluated: self.evaluated,
+            records: self.records,
+            #[cfg(feature = "metal-bench")]
+            gpu_s: self.gpu_s,
+        }
+    }
 }
 impl Screen {
     #[cfg(feature = "metal-bench")]
@@ -220,7 +233,7 @@ impl Screen {
             mode,
             prefix: None,
             counts: shared_buffer(device, 8)?,
-            hits: shared_buffer(device, MINING_SCREEN_CAP as usize * 4)?,
+            hits: shared_buffer(device, PROBE_CAP as usize * size_of::<u32>())?,
             records: shared_buffer(device, PROBE_CAP as usize * 36)?,
         })
     }
@@ -238,9 +251,9 @@ impl Screen {
         arity: u8,
         check: bool,
         recover: bool,
-    ) -> Result<ScreenResult, String> {
+    ) -> Result<ScreenResult<&[u32]>, String> {
         if count == 0
-            || count > MINING_SCREEN_CAP
+            || count > SETTLED_SCREEN_CAP
             || (check && count > PROBE_CAP)
             || start.checked_add(count - 1).is_none()
         {
@@ -277,7 +290,7 @@ impl Screen {
             Some(table) => &*table,
             empty @ None => &*empty.insert(tuning.ranks.build(queue.device(), &tables.host_ranks)?),
         };
-        let mut inline_args = [0u32; 40];
+        let mut inline_args = [0u32; 41];
         #[cfg(feature = "metal-bench")]
         let mode = self.mode;
         #[cfg(not(feature = "metal-bench"))]
@@ -298,6 +311,8 @@ impl Screen {
                 self.prefix = columns.then_some(*prefix);
             }
         }
+        let hit_capacity = (self.hits.length() / 4) as u32;
+        args[40] = hit_capacity;
         args[11..16].copy_from_slice(&[
             start,
             n,
@@ -322,7 +337,7 @@ impl Screen {
             if let Some(buffer) = mapped {
                 enc.set_buffer(0, Some(buffer), 0);
             } else {
-                enc.set_bytes(0, 96, inline_args.as_ptr().cast());
+                enc.set_bytes(0, size_of::<ScreenArgs>() as u64, inline_args.as_ptr().cast());
             }
             for (i, buf) in [ranks, single, &tables.values, &self.counts, &self.hits, &self.records].iter().enumerate()
             {
@@ -353,8 +368,16 @@ impl Screen {
         if evaluated > count || found > evaluated {
             return Err("invalid GPU screen count".into());
         }
-        // SAFETY: found <= count <= MINING_SCREEN_CAP. No writer is in flight.
-        let hits = unsafe { std::slice::from_raw_parts(self.hits.contents().cast::<u32>(), found as usize) }.to_vec();
+        if found > hit_capacity {
+            self.hits = shared_buffer(queue.device(), count as usize * size_of::<u32>())?;
+            let retry = self.scan(queue, rows, n, header, start, count, bound, arity, check, recover)?;
+            #[cfg(feature = "metal-bench")]
+            let retry = ScreenResult { gpu_s: retry.gpu_s + gpu_s, ..retry };
+            return Ok(retry);
+        }
+        // SAFETY: the counter fits the allocation and the command completed. The borrow
+        // prevents any later scan from overwriting the mapped nonces before they are consumed.
+        let hits = unsafe { std::slice::from_raw_parts(self.hits.contents().cast::<u32>(), found as usize) };
         let records = if check {
             // SAFETY: count <= PROBE_CAP and the validation pipeline wrote one record per input.
             unsafe { std::slice::from_raw_parts(self.records.contents().cast::<[u32; 9]>(), count as usize) }.to_vec()

@@ -28,7 +28,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -141,6 +141,7 @@ impl Unit {
 
 struct Shared {
     current: Mutex<Option<Arc<Unit>>>,
+    job_changed: Condvar,
     generation: AtomicU64,
     stop: AtomicBool,
     writer: Mutex<TcpStream>,
@@ -150,6 +151,15 @@ struct Shared {
     /// Height of the tip of the last job plus one; 0 before the first job.
     tip: AtomicU64,
     bits: AtomicU32,
+}
+
+impl Shared {
+    fn stop_workers(&self) {
+        // Use the waiter's mutex so shutdown cannot race between the predicate check and the wait.
+        let _current = self.current.lock().expect("current job");
+        self.stop.store(true, Ordering::Relaxed);
+        self.job_changed.notify_all();
+    }
 }
 
 /// The connection to the work service as seen by a worker.
@@ -167,6 +177,20 @@ impl Session {
     /// The job to mine, once the node has sent a model and a job.
     pub fn current(&self) -> Option<Arc<Unit>> {
         self.shared.current.lock().expect("current job").clone()
+    }
+
+    /// Let the socket reader wake a worker waiting for its first or next job.
+    /// A notification arriving before the worker waits is covered by the generation check.
+    pub fn wait_for_job_change(&self, previous: Option<&Unit>, timeout: Duration) {
+        let generation = previous.map(|u| u.generation);
+        let current = self.shared.current.lock().expect("current job");
+        let _guard = self
+            .shared
+            .job_changed
+            .wait_timeout_while(current, timeout, |job| {
+                !self.stopped() && job.as_ref().map(|u| u.generation) == generation
+            })
+            .expect("current job");
     }
 
     /// True when the connection ended or the miner is stopping.
@@ -246,7 +270,7 @@ impl MinerHandle {
     }
 
     pub fn stop(self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.stop_workers();
         let _ = self.shared.writer.lock().expect("writer").shutdown(std::net::Shutdown::Both);
         for t in self.threads {
             let _ = t.join();
@@ -298,6 +322,7 @@ pub fn start_with(
     let reader = stream.try_clone()?;
     let shared = Arc::new(Shared {
         current: Mutex::new(None),
+        job_changed: Condvar::new(),
         generation: AtomicU64::new(0),
         stop: AtomicBool::new(false),
         writer: Mutex::new(stream),
@@ -311,7 +336,7 @@ pub fn start_with(
         let shared = shared.clone();
         handles.push(thread::spawn(move || {
             read_frames(reader, &shared);
-            shared.stop.store(true, Ordering::Relaxed);
+            shared.stop_workers();
         }));
     }
     handles.extend(spawn(&Session { shared: shared.clone() }));
@@ -399,6 +424,7 @@ fn install(shared: &Shared, job: Job, slot: u8, model: Arc<Model>) {
         slot,
     };
     *shared.current.lock().expect("current job") = Some(Arc::new(unit));
+    shared.job_changed.notify_all();
     shared.stats.jobs.fetch_add(1, Ordering::Relaxed);
 }
 

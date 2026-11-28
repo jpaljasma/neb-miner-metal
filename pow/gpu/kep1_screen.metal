@@ -66,6 +66,13 @@ typedef uint RankWord;
 constant uint live_tag = 1u << 27;
 #endif
 
+// Count every hit even if this first pass fills the bounded result buffer.
+// The host replays the same immutable range with enough space on overflow.
+inline void record_hit(device atomic_uint *counts, device uint *hits, uint capacity, uint nonce) {
+    uint index=atomic_fetch_add_explicit(counts+1,1u,memory_order_relaxed);
+    if(index<capacity) hits[index]=nonce;
+}
+
 // args: first header chaining value [8], header tail [3], starting nonce,
 // dataset size, ready pairs, triple prefix, complete pair count, target [8],
 // and the four cached BLAKE3 column vectors [16] when HEADER_COLUMNS is enabled.
@@ -240,7 +247,7 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
                     if(v!=args[16+j]) {hit=v<args[16+j];break;}
                 }
                 atomic_fetch_add_explicit(counts,1u,memory_order_relaxed);
-                if(hit) hits[atomic_fetch_add_explicit(counts+1,1u,memory_order_relaxed)]=nonce;
+                if(hit) record_hit(counts,hits,input_args[40],nonce);
             }
         }
     }
@@ -295,7 +302,7 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
     // Only the high word is live on the common path. A tie requires the remaining 224 bits.
     uint high_word=compress({iv_lo,iv_hi},block,64,11,args).hi.w;
     if(high_word!=args[23]) {
-        if(high_word<args[23]) hits[atomic_fetch_add_explicit(counts+1,1u,memory_order_relaxed)]=nonce;
+        if(high_word<args[23]) record_hit(counts,hits,input_args[40],nonce);
         return;
     }
     #endif
@@ -316,5 +323,5 @@ kernel void lookup_screen(constant const uint *input_args [[buffer(0)]],
         #endif
         }
     }
-    if(hit) hits[atomic_fetch_add_explicit(counts+1,1u,memory_order_relaxed)]=nonce;
+    if(hit) record_hit(counts,hits,input_args[40],nonce);
 }
