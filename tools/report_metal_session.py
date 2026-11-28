@@ -103,6 +103,13 @@ def phase(folder, handoff, live=False):
         if clean:
             e["ms_after_nearest_clean_notify"] = round(1000*(timestamp(e)-timestamp(clean)),2)
             e["nearest_clean_height"] = clean["height"]
+        if e.get("code") == 21 and sent and "sequence" in sent:
+            superseding = next((j for j in clean_jobs if j["connection"] == e["connection"]
+                                and j.get("sequence", -1) > sent["sequence"] and j.get("notify_read_utc")), None)
+            if superseding:
+                read_at = datetime.fromisoformat(superseding["notify_read_utc"]).timestamp()
+                e["submit_minus_superseding_notify_ms"] = round(1000*(timestamp(sent)-read_at), 2)
+                e["superseding_height"] = superseding["height"]
     # Keep output compact; the JSONL has every individual job, sample and event.
     return dict(folder=str(folder),outcome="planned_handoff" if handoff else summary["outcome"],
         first_job_utc=first["utc"], stop_utc=stop["utc"], duration_s=round(duration,3),
@@ -147,6 +154,11 @@ def markdown(reports):
                 detail = f"code {detail}, reply in {e['response_ms']} ms"
             if "ms_after_nearest_clean_notify" in e:
                 detail += f", Δ to nearest clean job (height {e['nearest_clean_height']}): {e['ms_after_nearest_clean_notify']:+.1f} ms"
+            if "submit_minus_superseding_notify_ms" in e:
+                delta = e["submit_minus_superseding_notify_ms"]
+                when = ("in the same logged millisecond as" if delta == 0 else
+                        f"{abs(delta):.1f} ms {'before' if delta < 0 else 'after'}")
+                detail += f", submitted {when} reading clean job {e['superseding_height']}"
             print(f"- {e['utc']} · {e['event']} · connection {e['connection']} · {slot} {detail}")
         print("\nCode 21 means stale or unknown job. Extranonce rolls reuse the pool connection. "
               "Completed MH/s uses completed tickets divided by the slot’s job time. "

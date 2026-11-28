@@ -11,6 +11,8 @@ python3 tools/test_metal_stratum.py --pool "$POOL_URL" --worker "$WORKER" \
 
 Use a new log filename per session. The adapter reads the payout address from the ignored `.neb-payout-address` file. Set the URL scheme to match the pool port. The TLS transport validates the certificate and hostname. The TCP transport connects in plaintext. A fresh subscription, authorization, target, model and job are required after a disconnect. The log distinguishes submissions, acknowledgements, rejections and unanswered submissions. A pool share acceptance is distinct from an on-chain payout.
 
+When a pool update and a miner hit are ready together, the adapter consumes buffered pool messages before checking whether the hit's local job is still valid. A clean notification retires the old jobs. A same-parent refresh preserves eligible work. The adapter queues the submission on the socket before logging it, and records the originating job sequence. For a stale rejection, the session report can compare the submission with the time the adapter read the first clean notification that superseded that job. The pool may already have changed jobs before that notification reaches the miner.
+
 For an intentional reconnect test add `--test-reconnect`. For exclusive benchmarks add `--pause-file build/PAUSE`; create this file to drain pending shares, disconnect and reap the worker, then remove it to resume. The duration begins at the first job and excludes these pauses. The deadline stops mining and gives outstanding replies a short grace period. Local nonce exhaustion rolls extranonce2 under the original pool job, retaining the connection and using a distinct header.
 
 ## Controlled measurements

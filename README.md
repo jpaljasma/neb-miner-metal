@@ -19,7 +19,7 @@ The two miners make different tradeoffs. This backend spent 306 ms on Kepler and
 
 In a 30-minute Suprnova pool run on the same Mac, Kepler averaged **23.22 MH/s** and TESS averaged **93.30 MH/s**. Each rate counts completed tickets over the time the pool assigned that model, including setup. Suprnova accepted 59 of 59 Kepler shares and 19 of 20 TESS shares. One TESS share went stale at a job change. [Pool tests and tuning](docs/metal-pool-tuning.md)
 
-When the model changes, a dedicated two-row Metal kernel builds the pair lookup table. On a held-out Kepler model it cut table construction from **5.07 s to 2.48 s**. [Model-turnover benchmarks](docs/metal-turnover.md)
+When the model changes, a dedicated two-row Metal kernel builds the pair lookup table. On a held-out Kepler model it cut table construction from 5.07 s to 2.48 s. Reading the factors directly with 64 threads per pair brought that down to **1.64 s**. [Model-turnover benchmarks](docs/metal-turnover.md#reading-kepler-factors-directly)
 
 The miner uses the available CPU cores to prepare new model weights for the GPU. Across two M1 Max replays per model, ten setup threads produced **2.04–2.06× as many Kepler tickets** and **1.29–1.31× as many TESS tickets** as one thread during the first five seconds of a job. [CPU thread benchmark](docs/metal-turnover.md#cpu-threads-during-metal-job-setup)
 

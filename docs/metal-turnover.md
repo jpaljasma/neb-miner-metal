@@ -126,3 +126,15 @@ done
 ```
 
 Set `old` and `new` to your snapshot directories. The argument after the mask toggles the precomputed dense-output mask for B. The following integer seeds the replay headers. Repeat with different weights for holdout testing and rotate arm order when recording timings. The `builders`, `copy`, `extra` and `paired-short` modes use the same argument order for component and five-second confirmation runs.
+
+## Reading Kepler factors directly
+
+A follow-up crossed 256, 128 and 64 threads per pair with three ways to access the dense inputs: staging both rows in threadgroup memory, reading them directly from the existing Metal row buffer, and direct reads with the input loop outside the active-output loop. Each of 48 order-balanced blocks computed and byte-hashed the same 65,536 pair digests for every configuration. The holdout used different weights and different pair ranges.
+
+Kepler's selected configuration uses direct reads and 64 threads per pair. It eliminates the factor-staging copy and its barrier. The only threadgroup allocation is 64 bytes for combining the two SIMD groups' partial digests. Against the previous 256-thread masked builder, builder throughput rose 58.20% on the initial snapshot and **55.54%** on the holdout (90% paired interval +53.32% to +58.21%). Direct reads at the original width gave +24.04% on the holdout. The narrower group with the original staging gave +17.75%.
+
+The complete pair tables matched byte for byte. Kepler construction went from 1.421 s to 0.946 s on the adjacent transition and from **2.485 s to 1.640 s** on the holdout. Six paired five-second reverse-transition runs measured **39.47%** more completed tickets (+36.00% to +42.76%). These gains describe model setup and the first five seconds after a change. The prepared-table nonce scan uses the same kernel as before. TESS retains its previous builder.
+
+We also tried combining rank checks in groups of eight or sixteen and using the already-ordered ranks to simplify triangular indexing. The best scan-only candidate gained 0.62% in the initial screen and lost 1.14% on the holdout. The production scan retains the four-sample early exit.
+
+Use the `geometry` replay mode with slot 0, mask 2 and the masked builder to compare the nine pair kernels. IDs 0–2 use 256 threads, 3–5 use 128, and 6–8 use 64. Within each width, the order is staged, direct, then input-first. Use `direct-fixed` to verify the full table and `paired-direct` to compare first-five-second work in alternating order.
